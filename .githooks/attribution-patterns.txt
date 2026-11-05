@@ -1,0 +1,6 @@
+(co-authored-by|authored-by|signed-off-by):.*(claude|anthropic)
+generated (with|by) .*claude
+claude-session:
+claude\.ai/code
+noreply@anthropic
+🤖

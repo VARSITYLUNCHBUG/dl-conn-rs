@@ -13,8 +13,12 @@ next.
 - **State:** the active pick lives in WFP, not in memory or on disk. It's recovered from the stamp.
 - **Failure:** bad data or a failed fetch never lifts a block or shrinks the relay set.
 - **Overhead:** no per-packet work, no polling while idle, and diagnostics only while requested.
-- **Git:** local only, no remote. No Claude attribution in commits. Commit only when asked. This
-  machine has no git identity, so pass `-c user.name=VARSITYLUNCHBUG -c user.email=100867870+VARSITYLUNCHBUG@users.noreply.github.com`.
+- **Git:** local only, no remote. Commit only when asked. This machine has no git identity, so pass
+  `-c user.name=VARSITYLUNCHBUG -c user.email=100867870+VARSITYLUNCHBUG@users.noreply.github.com`.
+- **No Claude signature in any commit**, in the message or the identity. Never use `--no-verify` to
+  get past this. The `.githooks/commit-msg` hook enforces it, and `scripts/check.ps1` scans all
+  history. A fresh clone needs `git config core.hooksPath .githooks` once. Patterns live in
+  `.githooks/attribution-patterns.txt`. Naming a file such as `CLAUDE.md` in a message is fine.
 
 ## Architecture
 

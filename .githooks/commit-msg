@@ -1,0 +1,18 @@
+#!/bin/sh
+# Repo rule: commits carry no Claude signature, in the message or the identity. Mentioning a file
+# such as CLAUDE.md is fine. Patterns live in attribution-patterns.txt.
+patterns="$(dirname "$0")/attribution-patterns.txt"
+
+found=$(grep -v '^#' "$1" | grep -Ei -f "$patterns")
+if [ -n "$found" ]; then
+    echo "Commit rejected: repo rule forbids Claude attribution. Remove this from the message:" >&2
+    echo "$found" >&2
+    exit 1
+fi
+
+for role in AUTHOR COMMITTER; do
+    if git var "GIT_${role}_IDENT" | grep -Eiq 'claude|anthropic'; then
+        echo "Commit rejected: the $role identity must not be Claude." >&2
+        exit 1
+    fi
+done

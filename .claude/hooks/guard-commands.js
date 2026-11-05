@@ -1,5 +1,17 @@
 // PreToolUse: refuses commands that break this repo's rules. See CLAUDE.md.
 const { spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+// Shared with the commit-msg hook, so there's one definition of a Claude signature.
+function attributionPatterns() {
+  const file = path.join(__dirname, '..', '..', '.githooks', 'attribution-patterns.txt');
+  return fs
+    .readFileSync(file, 'utf8')
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => new RegExp(line, 'iu'));
+}
 
 function deny(reason) {
   process.stdout.write(
@@ -35,7 +47,7 @@ process.stdin.on('end', () => {
     return;
   }
 
-  if (/\bgit\b[^\n;|&]*\bcommit\b/.test(command) && /co-authored-by|generated with \[?claude/i.test(command)) {
+  if (/\bgit\b[^\n;|&]*\bcommit\b/.test(command) && attributionPatterns().some((p) => p.test(command))) {
     deny('Commit messages in this repo must not contain Claude attribution. Remove it and commit again.');
     return;
   }

@@ -22,6 +22,22 @@ if ($bad) {
     $failed += 'ascii'
 }
 
+Write-Output '--- commit rule'
+if ((git config core.hooksPath) -ne '.githooks') {
+    Write-Output 'core.hooksPath is not set. Run: git config core.hooksPath .githooks'
+    $failed += 'commit rule'
+}
+$patterns = Get-Content .githooks\attribution-patterns.txt -Encoding UTF8 | Where-Object { $_ }
+foreach ($commit in git log --all --format='%h') {
+    $text = (git log -1 --format='%an %ae%n%cn %ce%n%B' $commit) -join "`n"
+    $hits = @($patterns | Where-Object { $text -match $_ })
+    if ((git log -1 --format='%an %ae %cn %ce' $commit) -match 'claude|anthropic') { $hits += 'identity' }
+    if ($hits.Count) {
+        Write-Output "$commit carries a Claude signature: $($hits -join ', ')"
+        $failed += 'commit rule'
+    }
+}
+
 Step 'clippy' { cargo clippy --all-targets --quiet -- -D warnings }
 Step 'unit tests' { cargo test --quiet }
 
