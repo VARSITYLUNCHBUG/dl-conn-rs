@@ -8,18 +8,33 @@ pub type ServerName = (String, String);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    Help { topic: Option<String> },
-    ListServers { filter: Option<String> },
-    ListRelays { server: Option<String> },
+    Help {
+        topic: Option<String>,
+    },
+    ListServers {
+        filter: Option<String>,
+    },
+    ListRelays {
+        server: Option<String>,
+    },
     ShowStatus,
-    SetPick { server: String },
+    SetPick {
+        server: String,
+        backup: Option<String>,
+    },
     ClearPick,
     RefreshRelays,
-    ShowRoutes { server: Option<String> },
-    PingRelays { server: Option<String> },
+    ShowRoutes {
+        server: Option<String>,
+    },
+    PingRelays {
+        server: Option<String>,
+    },
     ShowProcesses,
     ShowReport,
-    StartReport { every: Option<u64> },
+    StartReport {
+        every: Option<u64>,
+    },
     StopReport,
     ToggleConsole,
     ClearScreen,
@@ -64,6 +79,8 @@ struct Spec {
 }
 
 const OPTIONAL_SERVER: &[Param] = &[Param::Server { required: false }];
+/// An option with this value completes to server codes.
+const SERVER_VALUE: &str = "<server>";
 
 static COMMANDS: &[Spec] = &[
     Spec {
@@ -109,12 +126,22 @@ static COMMANDS: &[Spec] = &[
     Spec {
         verb: "set",
         noun: "pick",
-        params: &[Param::Server { required: true }],
+        params: &[
+            Param::Server { required: true },
+            Param::Option {
+                name: "--backup",
+                value: SERVER_VALUE,
+                about: "Also keep this server open, so the game has a failover relay",
+            },
+        ],
         summary: "Block every relay except this server's",
         build: |args| {
-            Ok(Command::SetPick {
-                server: args.server.unwrap_or_default(),
-            })
+            let backup = args.option("--backup");
+            let server = args.server.unwrap_or_default();
+            if backup.as_ref() == Some(&server) {
+                return Err("--backup must be a different server from the pick".to_string());
+            }
+            Ok(Command::SetPick { server, backup })
         },
     },
     Spec {
@@ -501,14 +528,19 @@ fn arguments(previous: &[String], word: &str, servers: &[ServerName]) -> Vec<Can
         return Vec::new();
     };
     let given = &previous[used..];
-    // A value is expected right after an option, and there's nothing useful to suggest for it.
-    let awaiting_value = given.last().is_some_and(|last| {
-        spec.params
-            .iter()
-            .any(|param| matches!(param, Param::Option { name, .. } if name == last))
+    // Right after an option comes its value, and only some values have anything to suggest.
+    let awaited = given.last().and_then(|last| {
+        spec.params.iter().find_map(|param| match param {
+            Param::Option { name, value, .. } if name == last => Some(*value),
+            _ => None,
+        })
     });
-    if awaiting_value {
-        return Vec::new();
+    if let Some(value) = awaited {
+        return if value == SERVER_VALUE {
+            matching_servers(word, servers)
+        } else {
+            Vec::new()
+        };
     }
     let mut candidates = Vec::new();
     for param in spec.params {
@@ -521,7 +553,7 @@ fn arguments(previous: &[String], word: &str, servers: &[ServerName]) -> Vec<Can
                     note: format!("{value}  {about}"),
                 });
             }
-            Param::Server { .. } if !word.starts_with('-') && !has_server(given) => {
+            Param::Server { .. } if !word.starts_with('-') && !has_server(spec, given) => {
                 candidates.extend(matching_servers(word, servers));
             }
             _ => {}
@@ -530,8 +562,21 @@ fn arguments(previous: &[String], word: &str, servers: &[ServerName]) -> Vec<Can
     candidates
 }
 
-fn has_server(given: &[String]) -> bool {
-    given.iter().any(|arg| !arg.starts_with("--"))
+/// Whether the line already names the server, as opposed to an option's value.
+fn has_server(spec: &Spec, given: &[String]) -> bool {
+    let mut args = given.iter();
+    while let Some(arg) = args.next() {
+        let is_option = spec
+            .params
+            .iter()
+            .any(|param| matches!(param, Param::Option { name, .. } if name == arg));
+        if is_option {
+            args.next();
+        } else if !arg.starts_with("--") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Servers whose code starts with the word, or, failing that, whose name contains it.
@@ -614,7 +659,8 @@ mod tests {
         assert_eq!(
             parse("set pick FRA"),
             Ok(Command::SetPick {
-                server: "fra".to_string()
+                server: "fra".to_string(),
+                backup: None
             })
         );
         assert_eq!(parse("  clear   pick "), Ok(Command::ClearPick));
@@ -649,6 +695,41 @@ mod tests {
                 topic: Some("set pick".to_string())
             })
         );
+    }
+
+    #[test]
+    fn parses_a_backup_in_either_position() {
+        let expected = Ok(Command::SetPick {
+            server: "sgp".to_string(),
+            backup: Some("maa2".to_string()),
+        });
+        assert_eq!(parse("set pick sgp --backup maa2"), expected);
+        assert_eq!(parse("set pick --backup maa2 sgp"), expected);
+        assert!(
+            parse("set pick --backup maa2")
+                .unwrap_err()
+                .contains("missing <server>")
+        );
+        assert!(
+            parse("set pick sgp --backup")
+                .unwrap_err()
+                .contains("needs <server>")
+        );
+        assert!(
+            parse("set pick sgp --backup SGP")
+                .unwrap_err()
+                .contains("different server")
+        );
+    }
+
+    #[test]
+    fn completes_a_backup_server() {
+        assert_eq!(texts("set pick fra --backup j"), ["jnb"]);
+        assert_eq!(texts("set pick fra --backup south"), ["jnb"]);
+        assert_eq!(texts("set pick fra --b"), ["--backup"]);
+        assert_eq!(texts("set pick fra "), ["--backup"]);
+        assert!(texts("set pick fra --backup jnb ").is_empty());
+        assert_eq!(texts("set pick --backup jnb f"), ["fra"]);
     }
 
     #[test]
@@ -740,7 +821,7 @@ mod tests {
 
     #[test]
     fn stops_offering_a_server_once_one_is_given() {
-        assert!(texts("set pick fra ").is_empty());
+        assert!(!texts("set pick fra ").contains(&"jnb".to_string()));
         assert!(texts("quit ").is_empty());
         assert!(texts("clear pick ").is_empty());
     }

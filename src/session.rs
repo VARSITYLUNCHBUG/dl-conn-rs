@@ -67,6 +67,7 @@ pub struct Status {
     pub pick: String,
     /// `None` until the pick is found in a loaded relay list.
     pub pick_desc: Option<String>,
+    pub backup: Option<String>,
     pub blocked: usize,
     pub sites_blocked: usize,
     pub loaded: bool,
@@ -108,8 +109,13 @@ impl Output {
                 let pick = match (status.pick.as_str(), &status.pick_desc) {
                     ("", _) => "pick: none, all servers open".to_string(),
                     (pick, Some(desc)) => format!(
-                        "pick: {pick} {desc}, {} relays blocked across {} sites",
-                        status.blocked, status.sites_blocked
+                        "pick: {pick} {desc}{}, {} relays blocked across {} sites",
+                        status
+                            .backup
+                            .as_ref()
+                            .map_or(String::new(), |backup| format!(", backup {backup}")),
+                        status.blocked,
+                        status.sites_blocked
                     ),
                     (pick, None) => format!("pick: {pick}, not in the loaded relay list"),
                 };
@@ -265,6 +271,7 @@ struct Session<F, H> {
     host: H,
     pops: Pops,
     pick: String,
+    backup: Option<String>,
     offline: bool,
     error: Option<String>,
     report: Option<Report>,
@@ -275,13 +282,13 @@ struct Session<F, H> {
 impl<F: Firewall, H: Host> Session<F, H> {
     /// Recovers the pick from the firewall, so reopening mid-session picks up where it left off.
     fn new(firewall: F, host: H, wake: Sender<Wake>) -> Self {
-        let stamp = firewall.stamp().unwrap_or_default();
-        let pick = stamp.split(' ').next().unwrap_or_default().to_string();
+        let (pick, backup) = sdr::sites_in_stamp(&firewall.stamp().unwrap_or_default());
         Self {
             firewall,
             host,
             pops: Pops::new(),
             pick,
+            backup,
             offline: false,
             error: None,
             report: None,
@@ -291,7 +298,7 @@ impl<F: Firewall, H: Host> Session<F, H> {
     }
 
     fn run(mut self, rx: &Receiver<Message>) {
-        log!("start: active pick {:?}", self.pick);
+        log!("start: active {:?}", self.open_sites().join(" + "));
         self.host.changed();
         loop {
             let wait = self.report.as_ref().map_or(Duration::MAX, |report| {
@@ -357,7 +364,7 @@ impl<F: Firewall, H: Host> Session<F, H> {
             Command::ListServers { filter } => Ok(self.list_servers(filter.as_deref())),
             Command::ListRelays { server } => self.list_relays(server.as_deref()),
             Command::ShowStatus => Ok(Output::Status(self.status())),
-            Command::SetPick { server } => self.set_pick(server),
+            Command::SetPick { server, backup } => self.set_pick(server, backup),
             Command::ClearPick => self.clear_pick(),
             Command::RefreshRelays => {
                 let _ = self.wake.send(Wake::Now);
@@ -370,7 +377,7 @@ impl<F: Firewall, H: Host> Session<F, H> {
                 &self.targets(server.as_deref())?,
             ))),
             Command::ShowProcesses => Ok(Output::line(diag::processes())),
-            Command::ShowReport => Ok(Output::Lines(diag::report(&self.pops, &self.pick))),
+            Command::ShowReport => Ok(Output::Lines(diag::report(&self.pops, &self.open_sites()))),
             Command::StartReport { every } => self.start_report(every),
             Command::StopReport => {
                 self.stop_report();
@@ -429,10 +436,11 @@ impl<F: Firewall, H: Host> Session<F, H> {
     }
 
     fn status(&self) -> Status {
-        let blocks = sdr::blocklist(&self.pops, &self.pick);
+        let blocks = sdr::blocklist(&self.pops, &self.open_sites());
         Status {
             pick: self.pick.clone(),
             pick_desc: self.pops.get(&self.pick).map(|pop| pop.desc.clone()),
+            backup: self.backup.clone(),
             blocked: blocks.values().map(Vec::len).sum(),
             sites_blocked: blocks.len(),
             loaded: !self.pops.is_empty(),
@@ -441,10 +449,15 @@ impl<F: Firewall, H: Host> Session<F, H> {
         }
     }
 
-    fn set_pick(&mut self, server: String) -> Reply {
+    /// A pick states the whole intent, so one without a backup removes any earlier backup.
+    fn set_pick(&mut self, server: String, backup: Option<String>) -> Reply {
         self.known(&server)?;
-        let changed = server != self.pick;
+        if let Some(backup) = &backup {
+            self.known(backup)?;
+        }
+        let changed = server != self.pick || backup != self.backup;
         self.pick = server;
+        self.backup = backup;
         self.reconcile()?;
         if changed {
             let _ = self.wake.send(Wake::Soon);
@@ -454,8 +467,19 @@ impl<F: Firewall, H: Host> Session<F, H> {
 
     fn clear_pick(&mut self) -> Reply {
         self.pick.clear();
+        self.backup = None;
         self.reconcile()?;
         Ok(Output::Status(self.status()))
+    }
+
+    /// The sites to keep open: none, the pick, or the pick and its backup.
+    fn open_sites(&self) -> Vec<&str> {
+        if self.pick.is_empty() {
+            return Vec::new();
+        }
+        std::iter::once(self.pick.as_str())
+            .chain(self.backup.as_deref())
+            .collect()
     }
 
     /// The relays a diagnostic command should look at: the named server's, or the pick's.
@@ -484,16 +508,20 @@ impl<F: Firewall, H: Host> Session<F, H> {
     /// Makes the firewall match the pick. Filter writes make Windows re-check every live flow, so
     /// this only writes when the stamp differs. Data problems leave the current block in place.
     fn reconcile(&mut self) -> Result<(), String> {
-        let result = if self.pick.is_empty() {
+        let open = self.open_sites();
+        let result = if open.is_empty() {
             self.firewall.clear()
-        } else if !self.pops.contains_key(&self.pick) {
+        } else if !open.iter().all(|site| self.pops.contains_key(*site)) {
             if !self.pops.is_empty() {
-                log!("pick {:?} not in config; keeping current block", self.pick);
+                log!(
+                    "{:?} not all in config; keeping current block",
+                    open.join(" + ")
+                );
             }
             Ok(())
         } else {
-            let blocks = sdr::blocklist(&self.pops, &self.pick);
-            let stamp = sdr::stamp(&self.pick, &blocks);
+            let blocks = sdr::blocklist(&self.pops, &open);
+            let stamp = sdr::stamp(&open, &blocks);
             if self.firewall.stamp().as_deref() == Some(&stamp) {
                 Ok(())
             } else {
@@ -525,7 +553,7 @@ impl<F: Firewall, H: Host> Session<F, H> {
     }
 
     fn report_tick(&mut self) {
-        diag::report(&self.pops, &self.pick)
+        diag::report(&self.pops, &self.open_sites())
             .into_iter()
             .for_each(log::line);
         if let Some(report) = &mut self.report {
@@ -638,6 +666,78 @@ mod tests {
         changed.remove("waw");
         session.relays(changed);
         assert_eq!(writes(&firewall), 2);
+    }
+
+    #[test]
+    fn a_backup_stays_open_and_is_recovered_on_reopen() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra --backup waw").unwrap();
+        assert!(firewall.stamp().unwrap().starts_with("fra+waw "));
+        let status = session.status();
+        assert_eq!(status.backup.as_deref(), Some("waw"));
+        assert_eq!((status.blocked, status.sites_blocked), (1, 1));
+        assert!(Output::Status(status).render()[0].contains("backup waw, 1 relays blocked"));
+
+        let (wake, _wake_rx) = channel();
+        let reopened = Session::new(firewall, FakeHost::default(), wake);
+        assert_eq!(reopened.pick, "fra");
+        assert_eq!(reopened.backup.as_deref(), Some("waw"));
+    }
+
+    #[test]
+    fn a_plain_pick_returns_to_strict_blocking() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra --backup waw").unwrap();
+        run(&mut session, "set pick fra").unwrap();
+        assert_eq!(session.backup, None);
+        assert!(firewall.stamp().unwrap().starts_with("fra "));
+        assert_eq!(writes(&firewall), 2);
+    }
+
+    #[test]
+    fn repeating_a_backup_writes_nothing_and_changing_it_does() {
+        let (mut session, firewall, _, wake) = session();
+        run(&mut session, "set pick fra --backup waw").unwrap();
+        assert!(matches!(wake.try_recv(), Ok(Wake::Soon)));
+        run(&mut session, "set pick fra --backup waw").unwrap();
+        assert_eq!(writes(&firewall), 1);
+        assert!(wake.try_recv().is_err());
+        run(&mut session, "set pick fra --backup jnb").unwrap();
+        assert_eq!(writes(&firewall), 2);
+        assert!(matches!(wake.try_recv(), Ok(Wake::Soon)));
+    }
+
+    #[test]
+    fn an_unknown_backup_errors_and_changes_nothing() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        let before = firewall.stamp();
+        let error = run(&mut session, "set pick waw --backup nope").unwrap_err();
+        assert!(error.contains("unknown server 'nope'"), "{error}");
+        assert_eq!(firewall.stamp(), before);
+        assert_eq!(session.pick, "fra");
+    }
+
+    #[test]
+    fn a_backup_leaving_the_list_keeps_the_block() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra --backup waw").unwrap();
+        let before = firewall.stamp();
+        let mut without_backup = pops();
+        without_backup.remove("waw");
+        session.relays(without_backup);
+        assert_eq!(firewall.stamp(), before);
+        assert_eq!(writes(&firewall), 1);
+    }
+
+    #[test]
+    fn clear_pick_removes_the_backup_too() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra --backup waw").unwrap();
+        run(&mut session, "clear pick").unwrap();
+        assert_eq!(firewall.stamp(), None);
+        assert_eq!(session.backup, None);
+        assert!(session.open_sites().is_empty());
     }
 
     #[test]

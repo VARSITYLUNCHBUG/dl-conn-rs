@@ -95,25 +95,43 @@ pub fn merge<'a>(configs: impl Iterator<Item = &'a Pops>) -> Pops {
     merged
 }
 
-/// Every relay except the pick's. An address the pick shares with another PoP stays open.
-pub fn blocklist<'a>(pops: &'a Pops, pick: &str) -> Blocks<'a> {
-    let Some(keep) = pops.get(pick) else {
+/// Every relay except the open sites'. An address they share with another PoP stays open. Nothing
+/// is blocked if any open site is unknown, so bad data can't cut off the one you asked for.
+pub fn blocklist<'a>(pops: &'a Pops, open: &[&str]) -> Blocks<'a> {
+    let mut keep = BTreeSet::new();
+    for code in open {
+        let Some(pop) = pops.get(*code) else {
+            return Blocks::new();
+        };
+        keep.extend(&pop.ips);
+    }
+    if keep.is_empty() {
         return Blocks::new();
-    };
+    }
     pops.iter()
-        .filter(|(code, _)| *code != pick)
+        .filter(|(code, _)| !open.contains(&code.as_str()))
         .filter_map(|(code, pop)| {
-            let ips: Vec<_> = pop.ips.difference(&keep.ips).copied().collect();
+            let ips: Vec<_> = pop.ips.difference(&keep).copied().collect();
             (!ips.is_empty()).then_some((code.as_str(), ips))
         })
         .collect()
 }
 
-/// Identifies an applied state, so unchanged data never touches the filters.
-pub fn stamp(pick: &str, blocks: &Blocks) -> String {
+/// Identifies an applied state, so unchanged data never touches the filters. The open sites are
+/// readable in it, which is how a reopened app recovers them.
+pub fn stamp(open: &[&str], blocks: &Blocks) -> String {
     let mut hasher = DefaultHasher::new();
     blocks.hash(&mut hasher);
-    format!("{pick} {:016x}", hasher.finish())
+    format!("{} {:016x}", open.join("+"), hasher.finish())
+}
+
+/// The open sites a stamp names: the pick, and the backup if there is one.
+pub fn sites_in_stamp(stamp: &str) -> (String, Option<String>) {
+    let sites = stamp.split(' ').next().unwrap_or_default();
+    match sites.split_once('+') {
+        Some((pick, backup)) => (pick.to_string(), Some(backup.to_string())),
+        None => (sites.to_string(), None),
+    }
 }
 
 struct Handle(*mut c_void);
@@ -271,7 +289,7 @@ mod tests {
     #[test]
     fn blocklist_never_blocks_an_address_the_pick_uses() {
         let pops = pops();
-        let blocks = blocklist(&pops, "fra");
+        let blocks = blocklist(&pops, &["fra"]);
         let shared: Ipv4Addr = "155.133.226.76".parse().unwrap();
         assert_eq!(blocks.len(), 1);
         assert!(!blocks["waw"].contains(&shared));
@@ -283,7 +301,9 @@ mod tests {
 
     #[test]
     fn unknown_pick_blocks_nothing() {
-        assert!(blocklist(&pops(), "nope").is_empty());
+        assert!(blocklist(&pops(), &["nope"]).is_empty());
+        assert!(blocklist(&pops(), &["fra", "nope"]).is_empty());
+        assert!(blocklist(&pops(), &[]).is_empty());
     }
 
     #[test]
@@ -302,10 +322,39 @@ mod tests {
     #[test]
     fn stamp_tracks_both_pick_and_relays() {
         let pops = pops();
-        let blocks = blocklist(&pops, "fra");
-        let same = stamp("fra", &blocks);
-        assert_eq!(same, stamp("fra", &blocklist(&pops, "fra")));
-        assert_ne!(same, stamp("fra", &Blocks::new()));
+        let blocks = blocklist(&pops, &["fra"]);
+        let same = stamp(&["fra"], &blocks);
+        assert_eq!(same, stamp(&["fra"], &blocklist(&pops, &["fra"])));
+        assert_ne!(same, stamp(&["fra"], &Blocks::new()));
+        assert_ne!(same, stamp(&["fra", "waw"], &blocks));
         assert!(same.starts_with("fra "));
+    }
+
+    #[test]
+    fn a_backup_stays_open_too() {
+        let pops = parse(
+            r#"{"pops":{"fra":{"desc":"F","relays":[{"ipv4":"1.1.1.1"}]},
+                        "waw":{"desc":"W","relays":[{"ipv4":"2.2.2.2"}]},
+                        "jnb":{"desc":"J","relays":[{"ipv4":"3.3.3.3"}]}}}"#,
+        )
+        .unwrap();
+        let blocks = blocklist(&pops, &["fra", "waw"]);
+        assert_eq!(blocks.keys().copied().collect::<Vec<_>>(), ["jnb"]);
+    }
+
+    #[test]
+    fn stamps_name_their_sites() {
+        let none = (String::new(), None);
+        assert_eq!(sites_in_stamp(""), none);
+        assert_eq!(sites_in_stamp("fra 0123"), ("fra".to_string(), None));
+        assert_eq!(
+            sites_in_stamp("fra+waw 0123"),
+            ("fra".to_string(), Some("waw".to_string()))
+        );
+        let blocks = Blocks::new();
+        assert_eq!(
+            sites_in_stamp(&stamp(&["fra", "waw"], &blocks)),
+            ("fra".to_string(), Some("waw".to_string()))
+        );
     }
 }

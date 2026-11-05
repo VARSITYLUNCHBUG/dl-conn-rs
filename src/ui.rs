@@ -167,8 +167,15 @@ fn title(status: &Status) -> String {
         }
         return format!("dl-rs - no block{offline}");
     }
+    let backup = status
+        .backup
+        .as_ref()
+        .map_or(String::new(), |backup| format!(" + {backup}"));
     match &status.pick_desc {
-        Some(desc) => format!("dl-rs - {desc} - {} blocked{offline}", status.blocked),
+        Some(desc) => format!(
+            "dl-rs - {desc}{backup} - {} blocked{offline}",
+            status.blocked
+        ),
         None => format!("dl-rs - {} active{offline}", status.pick),
     }
 }
@@ -340,6 +347,7 @@ mod tests {
         Status {
             pick: String::new(),
             pick_desc: None,
+            backup: None,
             blocked: 0,
             sites_blocked: 0,
             loaded: true,
@@ -381,6 +389,25 @@ mod tests {
         assert_eq!(
             view.title,
             "dl-rs - Johannesburg (South Africa) - 216 blocked"
+        );
+    }
+
+    #[test]
+    fn the_title_shows_a_backup() {
+        let view = build_view(
+            &servers(),
+            &Status {
+                pick: "ams".to_string(),
+                pick_desc: Some("Amsterdam (Netherlands)".to_string()),
+                backup: Some("jnb".to_string()),
+                blocked: 200,
+                ..status()
+            },
+        );
+        assert_eq!(view.items[view.selected].0, "ams");
+        assert_eq!(
+            view.title,
+            "dl-rs - Amsterdam (Netherlands) + jnb - 200 blocked"
         );
     }
 

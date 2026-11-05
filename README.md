@@ -30,7 +30,7 @@ up in the log.
 | `list servers [--filter <text>]` | List relay sites you can pick |
 | `list relays [<server>]` | List relay addresses, for all sites or one |
 | `show status` | Show the pick, what's blocked and connection state |
-| `set pick <server>` | Block every relay except this server's |
+| `set pick <server> [--backup <server>]` | Block every relay except this server's |
 | `clear pick` | Remove the block so all servers are open |
 | `refresh relays` | Fetch relay lists from Steam now |
 | `show routes [<server>]` | Show the interface and gateway to each relay |
@@ -52,6 +52,11 @@ up in the log.
 | \` | Hide the console |
 
 Servers complete by code or by name, so `set pick frank<Tab>` offers the Frankfurt sites.
+
+A strict pick also removes the backup relay the game normally keeps, so the connection depends on
+one relay. To keep a failover route, name a second site: `set pick sgp --backup maa2`. Both stay
+open and everything else is blocked. A later pick without `--backup`, including any dropdown choice,
+returns to strict blocking.
 
 The console's X button is removed because Windows ends the whole app when a console closes. Use
 \` to hide it. Show and hide assume a classic console window; with Windows Terminal set as the
@@ -117,6 +122,11 @@ differ a lot from the game's real path.
 
 Match your pick to the server ExitLag routes to. A block can't move a game that's already on a
 relay you've left open, and ExitLag's route choice is separate from dl-rs.
+
+## Development
+
+`CLAUDE.md` has the design rules and lessons learned, and `docs/roadmap.md` has planned features.
+`scripts/check.ps1` runs every check that doesn't need admin rights.
 
 ## Build and test
 

@@ -30,25 +30,32 @@ const PROBE: &[u8; 32] = b"dl-rs relay latency probe 32 byt";
 /// A filter on this PC refused the packet. On a picked relay that means another tool's rule.
 pub const IP_GENERAL_FAILURE: u32 = 11050;
 
-/// Everything at once: processes, the pick and its relays, and traffic blocked since the last one.
-pub fn report(pops: &Pops, pick: &str) -> Vec<String> {
+/// Everything at once: processes, the open sites and their relays, and traffic blocked since the
+/// last one.
+pub fn report(pops: &Pops, open: &[&str]) -> Vec<String> {
     let mut lines = vec![format!("-- processes: {}", processes())];
-    match pops.get(pick) {
-        Some(pop) => {
-            let blocks = blocklist(pops, pick);
-            let blocked: usize = blocks.values().map(Vec::len).sum();
+    let blocks = blocklist(pops, open);
+    if blocks.is_empty() {
+        lines.push("-- picking: nothing, all relays open".to_string());
+    } else {
+        let blocked: usize = blocks.values().map(Vec::len).sum();
+        lines.push(format!(
+            "-- picking: {}: {blocked} relays blocked across {} sites",
+            open.join(" + "),
+            blocks.len()
+        ));
+        for code in open {
+            let pop = &pops[*code];
             lines.push(format!(
-                "-- picking: {pick} {}: {} relays open, {blocked} blocked across {} sites",
+                "   {code} {}: {} relays open",
                 pop.desc,
-                pop.ips.len(),
-                blocks.len()
+                pop.ips.len()
             ));
             let ips: Vec<Ipv4Addr> = pop.ips.iter().copied().collect();
             for (rtt, ip) in probe(&ips) {
                 lines.push(format!("   {ip:<16} {:>15}  {}", latency(rtt), route(ip)));
             }
         }
-        None => lines.push("-- picking: nothing, all relays open".to_string()),
     }
     lines.extend(drops(pops));
     lines

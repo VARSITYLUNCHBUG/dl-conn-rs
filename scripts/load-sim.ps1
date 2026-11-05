@@ -6,7 +6,7 @@
 #   -Scenario game -ExeName deadlock.exe -Pick sgp
 # That scenario only ever picks the server ExitLag is routing to, so it can't cut the game off.
 param(
-    [ValidateSet('load', 'game')][string]$Scenario = 'load',
+    [ValidateSet('load', 'game', 'probe')][string]$Scenario = 'load',
     [string]$Pick = 'sgp',
     [Parameter(Mandatory)][string]$SimExe,
     [Parameter(Mandatory)][string]$AppExe,
@@ -152,6 +152,33 @@ function NoteWire($label, $counts, $config, $pickCode) {
     Note "$label busiest other destinations: $(($others | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', ')"
 }
 
+# Applies the block during a real match and measures its effect and dl-rs's own cost. Sends no test
+# traffic, opens no console so it can't take focus, and leaves dl-rs running with the block on.
+function ProbeScenario($config) {
+    $pickRelay = $config.pops.$Pick
+    Note "--- 1. the match with no block, 15 s"
+    CaptureStart 'probe-before'
+    Start-Sleep -Seconds 15
+    NoteWire 'before' (CaptureStop 'probe-before') $config $Pick
+
+    Note "--- 2. block applied during the match, 60 s"
+    $app = StartApp
+    [void][W]::PostMessage($app.Hwnd, 0x112, [IntPtr]0xF020, [IntPtr]::Zero)
+    Note "title: $(WaitTitle $app.Hwnd 'no block')"
+    PickItem $app $pickRelay.desc
+    Note "title: $(WaitTitle $app.Hwnd 'blocked')"
+    Note "block applied at $(Get-Date -Format HH:mm:ss)"
+    $proc = Get-Process -Id $app.Proc.Id
+    $cpuBefore = $proc.TotalProcessorTime
+    CaptureStart 'probe-block'
+    Start-Sleep -Seconds 60
+    NoteWire 'during' (CaptureStop 'probe-block') $config $Pick
+    $proc.Refresh()
+    $cpu = ($proc.TotalProcessorTime - $cpuBefore).TotalMilliseconds
+    Note ("dl-rs over 60 s: cpu {0:N0} ms, working set {1:N1} MB, private {2:N1} MB, threads {3}, handles {4}" -f $cpu, ($proc.WorkingSet64 / 1MB), ($proc.PrivateMemorySize64 / 1MB), $proc.Threads.Count, $proc.HandleCount)
+    Note "dl-rs left running with $Pick picked"
+}
+
 function GameScenario($config) {
     $pickRelay = @{ Code = $Pick; Ip = $config.pops.$Pick.relays[0].ipv4; Desc = $config.pops.$Pick.desc }
     $probes = @('fra', 'ams', 'lhr', 'waw', 'jnb', 'dfw', 'iad') | Where-Object { $_ -ne $Pick } | ForEach-Object { $config.pops.$_.relays[0].ipv4 }
@@ -222,6 +249,7 @@ try {
     Note ((Get-Process | Where-Object { $_.ProcessName -match 'exitlag|deadlock|cs2|dota2' } | ForEach-Object { "$($_.ProcessName)#$($_.Id)" }) -join ' ')
 
     $config = Invoke-RestMethod 'https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid=730'
+    if ($Scenario -eq 'probe') { ProbeScenario $config; return }
     if ($Scenario -eq 'game') { GameScenario $config; return }
     $relay = { param($code) @{ Code = $code; Ip = $config.pops.$code.relays[0].ipv4; Desc = $config.pops.$code.desc } }
     $openRelay = & $relay 'jnb'
@@ -299,6 +327,8 @@ finally {
     & cmd /c "pktmon stop >nul 2>&1"
     & cmd /c "pktmon filter remove >nul 2>&1"
     Get-ChildItem $OutDir -Filter *.etl -ErrorAction SilentlyContinue | Remove-Item -ErrorAction SilentlyContinue
+    # The probe deliberately leaves the block in place.
+    if ($Scenario -eq 'probe') { Note 'finished'; exit }
     Get-Process dl-rs -ErrorAction SilentlyContinue | Stop-Process -Force
     # Matches on the full path, so a real game with the same process name is never touched.
     Get-Process ([IO.Path]::GetFileNameWithoutExtension($ExeName)) -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $sim } | Stop-Process -Force
