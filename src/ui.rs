@@ -1,75 +1,70 @@
-//! Native Win32 UI: one dropdown, plus a hidden console toggled with the backtick key.
+//! Native Win32 UI: one dropdown. Every action is a command sent to the session, and everything it
+//! shows comes from querying the session, so the UI holds no logic of its own.
 
+use crate::console;
+use crate::session::{self, Handle, Host, Output, Server, Status};
 use crate::wfp::Engine;
 use crate::wide;
-use crate::worker::{self, Cmd};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::Controls::{EM_REPLACESEL, EM_SCROLLCARET, EM_SETLIMITTEXT, EM_SETSEL};
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_OEM_3};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
-use windows_sys::core::PCWSTR;
 use windows_sys::w;
 
 const WM_VIEW: u32 = WM_APP;
-const WM_LOG: u32 = WM_APP + 1;
 const ID_COMBO: usize = 1;
-const LOG_CAPACITY: usize = 1 << 20;
-const LOG_TRIM_AT: i32 = 900_000;
-const CONSOLE_TEXT: COLORREF = 0x00C8_E6C8;
 const CLIENT_WIDTH: i32 = 440;
 const CLIENT_HEIGHT: i32 = 48;
 const MARGIN: i32 = 12;
 const DROPDOWN_HEIGHT: i32 = 420;
+const NO_BLOCK_LABEL: &str = "No block - all servers";
 
 static COMBO: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
-static CONSOLE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
-static CONSOLE_EDIT: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static MAIN: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
-static TX: OnceLock<Sender<Cmd>> = OnceLock::new();
+static SESSION: OnceLock<Handle> = OnceLock::new();
 static PENDING_VIEW: Mutex<Option<View>> = Mutex::new(None);
-static PENDING_LOG: Mutex<String> = Mutex::new(String::new());
 /// (code, label) pairs currently in the dropdown. Only the UI thread touches this.
 static ITEMS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// The code the dropdown last showed, so closing it unchanged doesn't issue a command.
+static SELECTED: Mutex<String> = Mutex::new(String::new());
 
 /// What the dropdown and title bar should show.
-pub struct View {
-    pub items: Vec<(String, String)>,
-    pub selected: usize,
-    pub title: String,
+#[derive(Debug, PartialEq)]
+struct View {
+    items: Vec<(String, String)>,
+    selected: usize,
+    title: String,
 }
 
-/// Hands a new view to the UI thread. Only the latest one matters, so it overwrites.
-pub fn publish(view: View) {
-    *PENDING_VIEW.lock().unwrap() = Some(view);
-    unsafe { PostMessageW(MAIN.load(Ordering::Acquire), WM_VIEW, 0, 0) };
+struct UiHost {
+    changed: Sender<()>,
 }
 
-/// Queues a timestamped line for the console, which keeps it even while hidden.
-pub fn log_line(line: String) {
-    let time = unsafe {
-        let mut time: SYSTEMTIME = zeroed();
-        GetLocalTime(&mut time);
-        time
-    };
-    let stamped = format!(
-        "{:02}:{:02}:{:02}.{:03} {line}\r\n",
-        time.wHour, time.wMinute, time.wSecond, time.wMilliseconds
-    );
-    PENDING_LOG.lock().unwrap().push_str(&stamped);
-    let console = CONSOLE.load(Ordering::Acquire);
-    if !console.is_null() {
-        unsafe { PostMessageW(console, WM_LOG, 0, 0) };
+impl Host for UiHost {
+    fn toggle_console(&self) -> bool {
+        let visible = console::toggle();
+        if !visible {
+            unsafe { SetForegroundWindow(MAIN.load(Ordering::Acquire)) };
+        }
+        visible
+    }
+
+    fn quit(&self) {
+        unsafe { PostMessageW(MAIN.load(Ordering::Acquire), WM_CLOSE, 0, 0) };
+    }
+
+    fn changed(&self) {
+        let _ = self.changed.send(());
     }
 }
 
@@ -93,18 +88,18 @@ pub fn run() {
                 return;
             }
         };
-        let module = GetModuleHandleW(null());
-        register_class(module, w!("dl-rs"), main_proc);
-        register_class(module, w!("dl-rs-console"), console_proc);
-        create_console(module);
-        create_main(module);
-        let _ = TX.set(worker::spawn(engine));
+        create_main(GetModuleHandleW(null()));
+        let (changed, changes) = channel();
+        let session = session::spawn(engine, UiHost { changed });
+        console::init(session.clone());
+        let _ = SESSION.set(session.clone());
+        thread::spawn(move || view_loop(&session, &changes));
         let mut message: MSG = zeroed();
         while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
             // Filtered here so the key works whichever control has focus. The dropdown would
             // otherwise treat it as type-ahead.
             if message.message == WM_KEYDOWN && message.wParam == usize::from(VK_OEM_3) {
-                toggle_console();
+                run_command("toggle console");
                 continue;
             }
             TranslateMessage(&message);
@@ -113,17 +108,68 @@ pub fn run() {
     }
 }
 
-type WindowProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
+fn run_command(line: &str) {
+    if let Some(session) = SESSION.get() {
+        // The UI reacts to the "changed" signal rather than to individual replies.
+        let _ = session.run(line);
+    }
+}
 
-unsafe fn register_class(module: HMODULE, name: PCWSTR, proc: WindowProc) {
-    unsafe {
-        let mut class: WNDCLASSW = zeroed();
-        class.lpfnWndProc = Some(proc);
-        class.hInstance = module;
-        class.lpszClassName = name;
-        class.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
-        class.hbrBackground = (COLOR_BTNFACE + 1) as usize as HBRUSH;
-        RegisterClassW(&class);
+/// Refreshes the view whenever the session reports a change. It's a separate thread so the UI
+/// thread never waits on the session.
+fn view_loop(session: &Handle, changes: &Receiver<()>) {
+    while changes.recv().is_ok() {
+        while changes.try_recv().is_ok() {}
+        let servers = session.query("list servers").recv();
+        let status = session.query("show status").recv();
+        if let (Ok(Ok(Output::Servers(servers))), Ok(Ok(Output::Status(status)))) =
+            (servers, status)
+        {
+            *PENDING_VIEW.lock().unwrap() = Some(build_view(&servers, &status));
+            unsafe { PostMessageW(MAIN.load(Ordering::Acquire), WM_VIEW, 0, 0) };
+        }
+    }
+}
+
+fn build_view(servers: &[Server], status: &Status) -> View {
+    let mut items: Vec<(String, String)> = servers
+        .iter()
+        .map(|server| {
+            let label = format!("{} - {}", server.desc, server.code);
+            (server.code.clone(), label)
+        })
+        .collect();
+    // A pick the config no longer lists stays visible, so the dropdown never misstates it.
+    if !status.pick.is_empty() && status.pick_desc.is_none() {
+        items.push((status.pick.clone(), status.pick.clone()));
+    }
+    items.sort_by_key(|(_, label)| (label.contains("(China)"), label.clone()));
+    items.insert(0, (String::new(), NO_BLOCK_LABEL.to_string()));
+    let selected = items
+        .iter()
+        .position(|(code, _)| *code == status.pick)
+        .unwrap_or(0);
+    View {
+        items,
+        selected,
+        title: title(status),
+    }
+}
+
+fn title(status: &Status) -> String {
+    if let Some(error) = &status.error {
+        return format!("dl-rs - {error}");
+    }
+    let offline = if status.offline { " (offline)" } else { "" };
+    if status.pick.is_empty() {
+        if !status.loaded && !status.offline {
+            return "dl-rs - loading".to_string();
+        }
+        return format!("dl-rs - no block{offline}");
+    }
+    match &status.pick_desc {
+        Some(desc) => format!("dl-rs - {desc} - {} blocked{offline}", status.blocked),
+        None => format!("dl-rs - {} active{offline}", status.pick),
     }
 }
 
@@ -133,6 +179,13 @@ fn scale(value: i32) -> i32 {
 
 unsafe fn create_main(module: HMODULE) {
     unsafe {
+        let mut class: WNDCLASSW = zeroed();
+        class.lpfnWndProc = Some(main_proc);
+        class.hInstance = module;
+        class.lpszClassName = w!("dl-rs");
+        class.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
+        class.hbrBackground = (COLOR_BTNFACE + 1) as usize as HBRUSH;
+        RegisterClassW(&class);
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let mut frame = RECT {
             left: 0,
@@ -186,68 +239,6 @@ unsafe fn create_main(module: HMODULE) {
     }
 }
 
-unsafe fn create_console(module: HMODULE) {
-    unsafe {
-        let window = CreateWindowExW(
-            0,
-            w!("dl-rs-console"),
-            w!("dl-rs console"),
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            scale(860),
-            scale(520),
-            null_mut(),
-            null_mut(),
-            module,
-            null(),
-        );
-        let edit = CreateWindowExW(
-            0,
-            w!("EDIT"),
-            null(),
-            WS_CHILD
-                | WS_VISIBLE
-                | WS_VSCROLL
-                | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32,
-            0,
-            0,
-            0,
-            0,
-            window,
-            null_mut(),
-            module,
-            null(),
-        );
-        let mut face: LOGFONTW = zeroed();
-        face.lfHeight = -scale(14);
-        let name = wide("Consolas");
-        face.lfFaceName[..name.len()].copy_from_slice(&name);
-        SendMessageW(edit, WM_SETFONT, CreateFontIndirectW(&face) as WPARAM, 0);
-        SendMessageW(edit, EM_SETLIMITTEXT, LOG_CAPACITY, 0);
-        CONSOLE_EDIT.store(edit, Ordering::Release);
-        CONSOLE.store(window, Ordering::Release);
-    }
-}
-
-fn toggle_console() {
-    let console = CONSOLE.load(Ordering::Acquire);
-    let show = unsafe { IsWindowVisible(console) } == 0;
-    unsafe {
-        ShowWindow(console, if show { SW_SHOW } else { SW_HIDE });
-        if show {
-            SetForegroundWindow(console);
-        }
-    }
-    send(Cmd::Console(show));
-}
-
-fn send(cmd: Cmd) {
-    if let Some(tx) = TX.get() {
-        let _ = tx.send(cmd);
-    }
-}
-
 unsafe extern "system" fn main_proc(
     window: HWND,
     message: u32,
@@ -289,8 +280,20 @@ unsafe fn send_selection() {
     let code = usize::try_from(index)
         .ok()
         .and_then(|i| ITEMS.lock().unwrap().get(i).map(|(code, _)| code.clone()));
-    if let Some(code) = code {
-        send(Cmd::Pick(code));
+    let Some(code) = code else {
+        return;
+    };
+    {
+        let mut selected = SELECTED.lock().unwrap();
+        if *selected == code {
+            return;
+        }
+        selected.clone_from(&code);
+    }
+    if code.is_empty() {
+        run_command("clear pick");
+    } else {
+        run_command(&format!("set pick {code}"));
     }
 }
 
@@ -304,6 +307,9 @@ unsafe fn apply_view(window: HWND) {
         let Some(view) = PENDING_VIEW.lock().unwrap().take() else {
             return;
         };
+        if let Some((code, _)) = view.items.get(view.selected) {
+            SELECTED.lock().unwrap().clone_from(code);
+        }
         // The lock isn't held across SendMessage, which can re-enter main_proc.
         let changed = *ITEMS.lock().unwrap() != view.items;
         if changed {
@@ -318,54 +324,102 @@ unsafe fn apply_view(window: HWND) {
     }
 }
 
-unsafe extern "system" fn console_proc(
-    window: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    unsafe {
-        match message {
-            WM_LOG => {
-                flush_log();
-                0
-            }
-            WM_SIZE => {
-                let (width, height) = ((lparam & 0xFFFF) as i32, ((lparam >> 16) & 0xFFFF) as i32);
-                MoveWindow(CONSOLE_EDIT.load(Ordering::Acquire), 0, 0, width, height, 1);
-                0
-            }
-            // Read-only edit controls paint through this message.
-            WM_CTLCOLORSTATIC => {
-                let device = wparam as HDC;
-                SetTextColor(device, CONSOLE_TEXT);
-                SetBkColor(device, 0);
-                GetStockObject(BLACK_BRUSH) as LRESULT
-            }
-            // Closing only hides it, since the app has to keep running.
-            WM_CLOSE => {
-                toggle_console();
-                0
-            }
-            _ => DefWindowProcW(window, message, wparam, lparam),
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-unsafe fn flush_log() {
-    let text = std::mem::take(&mut *PENDING_LOG.lock().unwrap());
-    if text.is_empty() {
-        return;
-    }
-    let edit = CONSOLE_EDIT.load(Ordering::Acquire);
-    unsafe {
-        if GetWindowTextLengthW(edit) > LOG_TRIM_AT {
-            SendMessageW(edit, EM_SETSEL, 0, (LOG_TRIM_AT / 2) as LPARAM);
-            SendMessageW(edit, EM_REPLACESEL, 0, w!("") as LPARAM);
+    fn server(code: &str, desc: &str) -> Server {
+        Server {
+            code: code.to_string(),
+            desc: desc.to_string(),
+            relays: 2,
         }
-        let end = GetWindowTextLengthW(edit) as usize;
-        SendMessageW(edit, EM_SETSEL, end, end as LPARAM);
-        SendMessageW(edit, EM_REPLACESEL, 0, wide(&text).as_ptr() as LPARAM);
-        SendMessageW(edit, EM_SCROLLCARET, 0, 0);
+    }
+
+    fn status() -> Status {
+        Status {
+            pick: String::new(),
+            pick_desc: None,
+            blocked: 0,
+            sites_blocked: 0,
+            loaded: true,
+            offline: false,
+            error: None,
+        }
+    }
+
+    fn servers() -> Vec<Server> {
+        vec![
+            server("pvgm", "Alibaba Cloud Shanghai (China)"),
+            server("jnb", "Johannesburg (South Africa)"),
+            server("ams", "Amsterdam (Netherlands)"),
+        ]
+    }
+
+    #[test]
+    fn dropdown_lists_no_block_first_and_china_last() {
+        let view = build_view(&servers(), &status());
+        let codes: Vec<&str> = view.items.iter().map(|(code, _)| code.as_str()).collect();
+        assert_eq!(codes, ["", "ams", "jnb", "pvgm"]);
+        assert_eq!(view.items[0].1, NO_BLOCK_LABEL);
+        assert_eq!(view.items[1].1, "Amsterdam (Netherlands) - ams");
+        assert_eq!(view.selected, 0);
+    }
+
+    #[test]
+    fn dropdown_selects_the_pick_and_the_title_reports_it() {
+        let view = build_view(
+            &servers(),
+            &Status {
+                pick: "jnb".to_string(),
+                pick_desc: Some("Johannesburg (South Africa)".to_string()),
+                blocked: 216,
+                ..status()
+            },
+        );
+        assert_eq!(view.items[view.selected].0, "jnb");
+        assert_eq!(
+            view.title,
+            "dl-rs - Johannesburg (South Africa) - 216 blocked"
+        );
+    }
+
+    #[test]
+    fn a_pick_missing_from_the_list_stays_visible() {
+        let view = build_view(
+            &servers(),
+            &Status {
+                pick: "gone".to_string(),
+                ..status()
+            },
+        );
+        assert_eq!(view.items[view.selected].0, "gone");
+        assert_eq!(view.title, "dl-rs - gone active");
+    }
+
+    #[test]
+    fn titles_cover_every_state() {
+        assert_eq!(title(&status()), "dl-rs - no block");
+        assert_eq!(
+            title(&Status {
+                loaded: false,
+                ..status()
+            }),
+            "dl-rs - loading"
+        );
+        assert_eq!(
+            title(&Status {
+                offline: true,
+                ..status()
+            }),
+            "dl-rs - no block (offline)"
+        );
+        assert_eq!(
+            title(&Status {
+                error: Some("denied".to_string()),
+                ..status()
+            }),
+            "dl-rs - denied"
+        );
     }
 }

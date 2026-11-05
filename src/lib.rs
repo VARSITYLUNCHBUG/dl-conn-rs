@@ -1,14 +1,21 @@
 //! dl-rs: pick one Steam relay region and block the rest, for this boot only.
+//!
+//! Commands are the only way to act on the app. The dropdown and the console are both thin
+//! front-ends that send command lines to the session.
 
 macro_rules! log {
-    ($($arg:tt)*) => { $crate::ui::log_line(format!($($arg)*)) };
+    ($($arg:tt)*) => { $crate::log::line(format!($($arg)*)) };
 }
 
+mod command;
+mod console;
 mod diag;
+mod editor;
+mod log;
 mod sdr;
+mod session;
 pub mod ui;
 mod wfp;
-mod worker;
 
 #[cfg(test)]
 mod live_tests;

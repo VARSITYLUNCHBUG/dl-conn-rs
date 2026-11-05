@@ -1,4 +1,4 @@
-//! Snapshots for the debug console: running processes, routes and relay latency.
+//! Snapshots behind the diagnostic commands: running processes, routes and relay latency.
 
 use crate::from_wide;
 use crate::sdr::{Pops, blocklist};
@@ -30,64 +30,84 @@ const PROBE: &[u8; 32] = b"dl-rs relay latency probe 32 byt";
 /// A filter on this PC refused the packet. On a picked relay that means another tool's rule.
 pub const IP_GENERAL_FAILURE: u32 = 11050;
 
-pub fn report(pops: &Pops, pick: &str) {
-    log!("-- processes: {}", processes());
+/// Everything at once: processes, the pick and its relays, and traffic blocked since the last one.
+pub fn report(pops: &Pops, pick: &str) -> Vec<String> {
+    let mut lines = vec![format!("-- processes: {}", processes())];
     match pops.get(pick) {
         Some(pop) => {
             let blocks = blocklist(pops, pick);
             let blocked: usize = blocks.values().map(Vec::len).sum();
-            log!(
-                "-- picking: {pick} {}: {} relays open, {blocked} blocked across {} PoPs",
+            lines.push(format!(
+                "-- picking: {pick} {}: {} relays open, {blocked} blocked across {} sites",
                 pop.desc,
                 pop.ips.len(),
                 blocks.len()
-            );
-            relays(pop.ips.iter().copied().collect());
+            ));
+            let ips: Vec<Ipv4Addr> = pop.ips.iter().copied().collect();
+            for (rtt, ip) in probe(&ips) {
+                lines.push(format!("   {ip:<16} {:>15}  {}", latency(rtt), route(ip)));
+            }
         }
-        None => log!("-- picking: nothing, all relays open"),
+        None => lines.push("-- picking: nothing, all relays open".to_string()),
     }
-    drops(pops);
+    lines.extend(drops(pops));
+    lines
 }
 
-/// Pings the pick's relays at once so a dead relay can't stall the report, best first.
-fn relays(ips: Vec<Ipv4Addr>) {
+/// Latency per relay, best first.
+pub fn pings(ips: &[Ipv4Addr]) -> Vec<String> {
+    probe(ips)
+        .into_iter()
+        .map(|(rtt, ip)| format!("{ip:<16} {:>15}", latency(rtt)))
+        .collect()
+}
+
+/// The route to each relay.
+pub fn routes(ips: &[Ipv4Addr]) -> Vec<String> {
+    ips.iter()
+        .map(|ip| format!("{ip:<16} {}", route(*ip)))
+        .collect()
+}
+
+/// Pings relays at once so a dead one can't stall the result, best first.
+fn probe(ips: &[Ipv4Addr]) -> Vec<(Result<u32, u32>, Ipv4Addr)> {
     let mut rows: Vec<_> = std::thread::scope(|scope| {
         let probes: Vec<_> = ips
-            .into_iter()
-            .map(|ip| scope.spawn(move || (ping(ip), ip, route(ip))))
+            .iter()
+            .map(|ip| scope.spawn(move || (ping(*ip), *ip)))
             .collect();
         probes.into_iter().filter_map(|p| p.join().ok()).collect()
     });
-    rows.sort_by_key(|(rtt, ip, _)| (rtt.is_err(), rtt.ok(), *ip));
-    for (rtt, ip, route) in rows {
-        let rtt = rtt.map_or_else(ping_error, |ms| format!("{ms} ms"));
-        log!("   {ip:<16} {rtt:>15}  {route}");
+    rows.sort_by_key(|(rtt, ip)| (rtt.is_err(), rtt.ok(), *ip));
+    rows
+}
+
+fn latency(rtt: Result<u32, u32>) -> String {
+    match rtt {
+        Ok(ms) => format!("{ms} ms"),
+        Err(IP_REQ_TIMED_OUT) => "timeout".to_string(),
+        Err(IP_GENERAL_FAILURE) => "blocked locally".to_string(),
+        Err(code) => format!("icmp error {code}"),
     }
 }
 
-fn ping_error(code: u32) -> String {
-    match code {
-        IP_REQ_TIMED_OUT => "timeout".to_string(),
-        IP_GENERAL_FAILURE => "blocked locally".to_string(),
-        code => format!("icmp error {code}"),
-    }
-}
-
-fn drops(pops: &Pops) {
+fn drops(pops: &Pops) -> Vec<String> {
     let owners: BTreeMap<Ipv4Addr, &str> = pops
         .iter()
         .flat_map(|(code, pop)| pop.ips.iter().map(move |ip| (*ip, code.as_str())))
         .collect();
     let drained = std::mem::take(&mut *DROPS.lock().unwrap());
-    for ((ip, app), count) in drained {
-        // The subscription sees every drop on the system; only relay traffic matters here.
-        if let Some(pop) = owners.get(&ip) {
-            log!("   blocked {app} -> {pop} {ip} x{count}");
-        }
-    }
+    // The subscription sees every drop on the system; only relay traffic matters here.
+    drained
+        .into_iter()
+        .filter_map(|((ip, app), count)| {
+            let pop = owners.get(&ip)?;
+            Some(format!("   blocked {app} -> {pop} {ip} x{count}"))
+        })
+        .collect()
 }
 
-fn processes() -> String {
+pub fn processes() -> String {
     let mut found = Vec::new();
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -129,7 +149,7 @@ fn route(ip: Ipv4Addr) -> String {
     }
 }
 
-/// One ICMP echo, in milliseconds. Sent directly, so it shows the ISP path, not ExitLag's.
+/// One ICMP echo, in milliseconds. A game's real path can differ, especially through ExitLag.
 pub fn ping(ip: Ipv4Addr) -> Result<u32, u32> {
     unsafe {
         let icmp = IcmpCreateFile();
