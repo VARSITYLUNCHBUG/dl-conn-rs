@@ -105,13 +105,18 @@ To add a command, add a `Spec` to the table in `command.rs` and handle its `Comm
 
 ExitLag's traffic to its own servers isn't touched, because only Valve relay addresses are matched.
 
-Its `nfextlag` driver also hooks UDP at `ALE_CONNECT_REDIRECT`, which runs before the point where
-dl-rs blocks. If it rewrites a boosted game's destination there, the block wouldn't see the relay
-address. A block filter at that earlier layer isn't an option: Windows accepts it, but in testing
-it stopped nothing, for new or live flows.
+Blocks work on a game boosted through ExitLag. In a live Deadlock session routed to Singapore, the
+game's traffic reached the network only as tunnels to ExitLag's nodes, yet its packets to other
+relays were still dropped before entering the tunnel. A simulator under the game's process name was
+tunnelled too, and every relay it probed showed at least as many drops as probes sent. Those counts
+include some of the game's own drops, since both share a process name.
 
-To check, boost the game in ExitLag, open the console and queue. `blocked <game>.exe -> ...` lines
-mean the block is catching its traffic.
+To check your own setup, boost the game, open the console and look for
+`blocked <game>.exe -> ...` lines. Latency in the console comes from unboosted pings, so it can
+differ a lot from the game's real path.
+
+Match your pick to the server ExitLag routes to. A block can't move a game that's already on a
+relay you've left open, and ExitLag's route choice is separate from dl-rs.
 
 ## Build and test
 
@@ -126,3 +131,8 @@ keystrokes. They briefly block real relays and one public DNS resolver, and open
 ```
 powershell -ExecutionPolicy Bypass -File scripts\live-test.ps1 -TestExe <target\debug\deps\dl_rs-*.exe> -AppExe <target\release\dl-rs.exe> -OutDir <dir>
 ```
+
+`scripts/load-sim.ps1` sends game-shaped UDP from `examples/loadsim.rs` and counts what reaches the
+network card with `pktmon`. Its rates are capped because it reaches real relays. Its `game` scenario
+tests a real game boosted through ExitLag, and only ever picks the server you name. See the top of
+the script for how to run it.
