@@ -3,24 +3,30 @@
 //! Front-ends only send command lines to a [`Handle`]. The session knows nothing about windows; a
 //! [`Host`] gives it the few things it needs from whichever front-end started it.
 
+use crate::analysis;
 use crate::command::{self, Command, ServerName};
 use crate::diag;
+use crate::guide;
 use crate::log;
+use crate::monitor::{self, Control, Direct, Monitor};
 use crate::sdr::{self, Blocks, Client, Pops};
+use crate::settings::{self, Row, Settings};
 use crate::wfp::Engine;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Steam serves this API with `max-age` up to 300 s, so polling faster would see nothing new.
-const REFRESH: Duration = Duration::from_secs(300);
+/// Failed fetches back off up to this, whatever the refresh setting.
+const RETRY_MAX: Duration = Duration::from_secs(300);
+/// Stands in for "never" when refreshing is manual.
+const MANUAL: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Picking pulls the next fetch forward, but never closer than this to the last one.
 const MIN_FETCH_GAP: Duration = Duration::from_secs(30);
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const MAX_JITTER_MS: u32 = 15_000;
-const REPORT_EVERY_SECS: u64 = 5;
 
 /// What the session blocks with. The real one is the WFP [`Engine`].
 pub trait Firewall: Send + 'static {
@@ -73,6 +79,7 @@ pub struct Status {
     pub loaded: bool,
     pub offline: bool,
     pub error: Option<String>,
+    pub monitor: Monitor,
 }
 
 /// A command's result as data, so a UI never has to parse text.
@@ -81,6 +88,7 @@ pub enum Output {
     Lines(Vec<String>),
     Servers(Vec<Server>),
     Status(Status),
+    Config(Vec<Row>),
 }
 
 impl Output {
@@ -129,8 +137,19 @@ impl Output {
                 if let Some(error) = &status.error {
                     lines.push(format!("error: {error}"));
                 }
+                lines.push(monitor::direct_label(&status.pick, &status.monitor.direct));
+                lines.push(monitor::route_label(&status.pick, &status.monitor));
                 lines
             }
+            Self::Config(rows) => rows
+                .iter()
+                .flat_map(|row| {
+                    [
+                        format!("{:<16} {}  ({})", row.key, row.value, row.allowed),
+                        format!("    {}", row.about),
+                    ]
+                })
+                .collect(),
         }
     }
 }
@@ -145,12 +164,15 @@ enum Message {
     },
     Relays(Pops),
     Offline,
+    Monitor(Monitor),
 }
 
 enum Wake {
     /// Refresh soon, respecting the minimum gap between fetches.
     Soon,
     Now,
+    /// The refresh setting changed. In minutes, with 0 meaning manual.
+    Interval(u32),
 }
 
 /// How front-ends reach the session. Cheap to clone.
@@ -187,12 +209,27 @@ impl Handle {
     }
 }
 
-pub fn spawn(engine: Engine, host: impl Host) -> Handle {
+pub fn spawn(firewall: impl Firewall, host: impl Host) -> Handle {
     let (tx, rx) = channel();
     let (wake_tx, wake_rx) = channel();
+    let settings_path = settings::default_path();
+    let (settings, notes) = settings_path
+        .as_deref()
+        .map_or_else(Default::default, settings::load);
+    notes.into_iter().for_each(log::line);
     let fetch_tx = tx.clone();
-    thread::spawn(move || fetch_loop(&fetch_tx, &wake_rx));
-    let session = Session::new(engine, host, wake_tx);
+    let minutes = settings.refresh_minutes;
+    thread::spawn(move || fetch_loop(&fetch_tx, &wake_rx, minutes));
+    let monitor_tx = tx.clone();
+    let control = monitor::spawn(
+        settings.ping_every,
+        settings.log_path.clone(),
+        move |state| monitor_tx.send(Message::Monitor(state)).is_ok(),
+    );
+    let mut session = Session::new(firewall, host, wake_tx);
+    session.settings = settings;
+    session.settings_path = settings_path;
+    session.control = Some(control);
     let handle = Handle {
         tx,
         servers: session.servers.clone(),
@@ -209,9 +246,18 @@ fn jitter() -> Duration {
     Duration::from_millis(u64::from(nanos % MAX_JITTER_MS))
 }
 
+fn refresh_every(minutes: u32) -> Duration {
+    if minutes == 0 {
+        MANUAL
+    } else {
+        Duration::from_secs(u64::from(minutes) * 60)
+    }
+}
+
 /// Keeps each app's last good config, so one failed fetch never shrinks the merged relay set.
-fn fetch_loop(tx: &Sender<Message>, wake: &Receiver<Wake>) {
+fn fetch_loop(tx: &Sender<Message>, wake: &Receiver<Wake>, minutes: u32) {
     let client = Client::new();
+    let mut refresh = refresh_every(minutes);
     let mut cache: [Option<Pops>; sdr::APPS.len()] = Default::default();
     let mut backoff = RETRY_MIN;
     loop {
@@ -243,10 +289,10 @@ fn fetch_loop(tx: &Sender<Message>, wake: &Receiver<Wake>) {
         }
         let delay = if all_ok {
             backoff = RETRY_MIN;
-            REFRESH
+            refresh
         } else {
             let current = backoff;
-            backoff = (backoff * 2).min(REFRESH);
+            backoff = (backoff * 2).min(RETRY_MAX);
             current
         };
         let mut next = fetched_at + delay + jitter();
@@ -254,6 +300,12 @@ fn fetch_loop(tx: &Sender<Message>, wake: &Receiver<Wake>) {
         loop {
             match wake.recv_timeout(next.saturating_duration_since(Instant::now())) {
                 Ok(Wake::Soon) => next = next.min(earliest),
+                Ok(Wake::Interval(minutes)) => {
+                    refresh = refresh_every(minutes);
+                    if all_ok {
+                        next = fetched_at + refresh + jitter();
+                    }
+                }
                 Ok(Wake::Now) | Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -277,6 +329,13 @@ struct Session<F, H> {
     report: Option<Report>,
     wake: Sender<Wake>,
     servers: Arc<Mutex<Vec<ServerName>>>,
+    settings: Settings,
+    /// `None` keeps settings for this session only.
+    settings_path: Option<PathBuf>,
+    control: Option<Sender<Control>>,
+    monitor: Monitor,
+    sent_targets: Option<(String, Vec<Ipv4Addr>)>,
+    game_running: fn() -> bool,
 }
 
 impl<F: Firewall, H: Host> Session<F, H> {
@@ -294,11 +353,18 @@ impl<F: Firewall, H: Host> Session<F, H> {
             report: None,
             wake,
             servers: Arc::default(),
+            settings: Settings::default(),
+            settings_path: None,
+            control: None,
+            monitor: Monitor::default(),
+            sent_targets: None,
+            game_running: diag::game_running,
         }
     }
 
     fn run(mut self, rx: &Receiver<Message>) {
         log!("start: active {:?}", self.open_sites().join(" + "));
+        self.sync_monitor();
         self.host.changed();
         loop {
             let wait = self.report.as_ref().map_or(Duration::MAX, |report| {
@@ -317,6 +383,12 @@ impl<F: Firewall, H: Host> Session<F, H> {
                 Ok(Message::Offline) => {
                     self.offline = true;
                     self.host.changed();
+                }
+                Ok(Message::Monitor(state)) => {
+                    if state != self.monitor {
+                        self.monitor = state;
+                        self.host.changed();
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => self.report_tick(),
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -351,10 +423,51 @@ impl<F: Firewall, H: Host> Session<F, H> {
             .collect();
         self.pops = pops;
         self.offline = false;
-        // Runs even when nothing changed, which restores filters removed behind our back; an
-        // unchanged stamp means no write.
-        if let Err(error) = self.reconcile() {
+        if self.holding() {
+            log!("relay list changed, holding the filter update while a game runs");
+        } else if let Err(error) = self.reconcile() {
+            // Runs even when nothing changed, which restores filters removed behind our back; an
+            // unchanged stamp means no write.
             log!("apply failed: {error}");
+        }
+        self.sync_monitor();
+    }
+
+    /// Whether a background relay update should wait for the game to close. Only the same pick
+    /// with new relay data waits. Missing filters are always repaired.
+    fn holding(&self) -> bool {
+        if !self.settings.hold_in_game {
+            return false;
+        }
+        let open = self.open_sites();
+        if open.is_empty() || !open.iter().all(|site| self.pops.contains_key(*site)) {
+            return false;
+        }
+        let Some(current) = self.firewall.stamp() else {
+            return false;
+        };
+        let wanted = sdr::stamp(&open, &sdr::blocklist(&self.pops, &open));
+        current != wanted
+            && sdr::sites_in_stamp(&current) == (self.pick.clone(), self.backup.clone())
+            && (self.game_running)()
+    }
+
+    /// Tells the monitor which relays to ping, when that has changed.
+    fn sync_monitor(&mut self) {
+        let Some(control) = &self.control else {
+            return;
+        };
+        let ips = self
+            .pops
+            .get(&self.pick)
+            .map_or_else(Vec::new, |pop| pop.ips.iter().copied().collect());
+        let targets = (self.pick.clone(), ips);
+        if self.sent_targets.as_ref() != Some(&targets) {
+            let _ = control.send(Control::Targets {
+                pick: targets.0.clone(),
+                ips: targets.1.clone(),
+            });
+            self.sent_targets = Some(targets);
         }
     }
 
@@ -384,10 +497,12 @@ impl<F: Firewall, H: Host> Session<F, H> {
                 Ok(Output::line("report stopped".to_string()))
             }
             Command::ToggleConsole => {
-                if self.host.toggle_console() {
+                if !self.host.toggle_console() {
+                    self.stop_report();
+                    Ok(Output::Lines(Vec::new()))
+                } else if self.settings.report_on_open {
                     self.start_report(None)
                 } else {
-                    self.stop_report();
                     Ok(Output::Lines(Vec::new()))
                 }
             }
@@ -395,11 +510,100 @@ impl<F: Firewall, H: Host> Session<F, H> {
                 log::clear();
                 Ok(Output::Lines(Vec::new()))
             }
+            Command::ShowConfig => Ok(Output::Config(self.settings.rows())),
+            Command::SetConfig { key, value } => self.set_config(&key, &value),
+            Command::ClearConfig { key } => self.clear_config(key.as_deref()),
+            Command::AnalyzeLog => self.analyze_log(),
+            Command::ShowGuide => Ok(Output::Lines(guide::lines())),
             Command::Quit => {
+                if self.settings.clear_on_exit
+                    && !self.pick.is_empty()
+                    && let Err(error) = self.clear_pick()
+                {
+                    log!("clear on exit failed: {error}");
+                }
                 self.host.quit();
                 Ok(Output::Lines(Vec::new()))
             }
         }
+    }
+
+    fn set_config(&mut self, key: &str, value: &str) -> Reply {
+        if key == "backup" && !value.trim().eq_ignore_ascii_case("none") && !self.pops.is_empty() {
+            self.known(&value.trim().to_lowercase())?;
+        }
+        self.settings.set(key, value)?;
+        self.apply_setting(key);
+        self.save_settings()?;
+        let shown = self.settings.rows().into_iter().find(|row| row.key == key);
+        Ok(Output::line(format!(
+            "{key} = {}",
+            shown.map_or(String::new(), |row| row.value)
+        )))
+    }
+
+    fn clear_config(&mut self, key: Option<&str>) -> Reply {
+        let keys: Vec<&str> = match key {
+            Some(key) => vec![key],
+            None => settings::names().map(|(name, _)| name).collect(),
+        };
+        for key in &keys {
+            self.settings.reset(key)?;
+            self.apply_setting(key);
+        }
+        self.save_settings()?;
+        Ok(Output::line(match key {
+            Some(key) => format!("{key} is back to its default"),
+            None => "all settings are back to their defaults".to_string(),
+        }))
+    }
+
+    /// A changed setting takes effect now, except that a default backup waits for the next pick so
+    /// that changing it doesn't rewrite filters.
+    fn apply_setting(&mut self, key: &str) {
+        match key {
+            "ping_every" => self.send_control(Control::PingEvery(self.settings.ping_every)),
+            "log_path" => self.send_control(Control::LogPath(self.settings.log_path.clone())),
+            "refresh_minutes" => {
+                let _ = self
+                    .wake
+                    .send(Wake::Interval(self.settings.refresh_minutes));
+            }
+            "report_every" => {
+                if let Some(report) = &mut self.report {
+                    report.every = Duration::from_secs(u64::from(self.settings.report_every));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn send_control(&self, message: Control) {
+        if let Some(control) = &self.control {
+            let _ = control.send(message);
+        }
+    }
+
+    fn save_settings(&self) -> Result<(), String> {
+        let Some(path) = &self.settings_path else {
+            return Ok(());
+        };
+        settings::save(path, &self.settings)
+            .map_err(|error| format!("applied for now, but it couldn't be saved: {error}"))
+    }
+
+    fn analyze_log(&self) -> Reply {
+        let (text, mut context) = diag::read_log(self.settings.log_path.as_deref())?;
+        context.pick.clone_from(&self.pick);
+        context.backup.clone_from(&self.backup);
+        context.exitlag = self.monitor.exitlag;
+        if let Direct::Ms(ms) = self.monitor.direct {
+            context.direct_ms = Some(ms);
+        }
+        Ok(Output::Lines(analysis::report(
+            &analysis::parse(&text),
+            &context,
+        )))
     }
 
     fn list_servers(&self, filter: Option<&str>) -> Output {
@@ -446,29 +650,54 @@ impl<F: Firewall, H: Host> Session<F, H> {
             loaded: !self.pops.is_empty(),
             offline: self.offline,
             error: self.error.clone(),
+            monitor: self.monitor.clone(),
         }
     }
 
-    /// A pick states the whole intent, so one without a backup removes any earlier backup.
+    /// A pick states the whole intent: its backup, or `none` for no backup, or the default backup
+    /// if it names neither. A default that can't be used falls back to strict with a note, because
+    /// a stale setting must never stop a pick.
     fn set_pick(&mut self, server: String, backup: Option<String>) -> Reply {
         self.known(&server)?;
-        if let Some(backup) = &backup {
-            self.known(backup)?;
-        }
+        let backup = match backup.as_deref() {
+            Some("none") => None,
+            Some(named) => {
+                self.known(named)?;
+                backup
+            }
+            None => self.default_backup(&server),
+        };
         let changed = server != self.pick || backup != self.backup;
         self.pick = server;
         self.backup = backup;
-        self.reconcile()?;
+        let result = self.reconcile();
+        self.sync_monitor();
+        result?;
         if changed {
             let _ = self.wake.send(Wake::Soon);
         }
         Ok(Output::Status(self.status()))
     }
 
+    fn default_backup(&self, server: &str) -> Option<String> {
+        let backup = self.settings.backup.as_ref()?;
+        if backup == server {
+            log!("default backup {backup} is the pick, so this pick is strict");
+            None
+        } else if self.pops.contains_key(backup) {
+            Some(backup.clone())
+        } else {
+            log!("default backup {backup} isn't in the relay list, so this pick is strict");
+            None
+        }
+    }
+
     fn clear_pick(&mut self) -> Reply {
         self.pick.clear();
         self.backup = None;
-        self.reconcile()?;
+        let result = self.reconcile();
+        self.sync_monitor();
+        result?;
         Ok(Output::Status(self.status()))
     }
 
@@ -534,7 +763,7 @@ impl<F: Firewall, H: Host> Session<F, H> {
     }
 
     fn start_report(&mut self, every: Option<u64>) -> Reply {
-        let secs = every.unwrap_or(REPORT_EVERY_SECS);
+        let secs = every.unwrap_or(u64::from(self.settings.report_every));
         if let Err(error) = self.firewall.watch_drops(true) {
             log!("drop watcher: {error}");
         }
@@ -894,6 +1123,271 @@ mod tests {
             wake.try_recv().is_err(),
             "an unchanged pick needs no refresh"
         );
+    }
+
+    #[test]
+    fn a_default_backup_applies_to_plain_picks() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set config backup waw").unwrap();
+        run(&mut session, "set pick fra").unwrap();
+        assert_eq!(session.backup.as_deref(), Some("waw"));
+        assert!(firewall.stamp().unwrap().starts_with("fra+waw "));
+    }
+
+    #[test]
+    fn backup_none_overrides_the_default_for_one_pick() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set config backup waw").unwrap();
+        run(&mut session, "set pick fra --backup none").unwrap();
+        assert_eq!(session.backup, None);
+        assert!(firewall.stamp().unwrap().starts_with("fra "));
+    }
+
+    #[test]
+    fn a_stale_default_backup_never_stops_a_pick() {
+        let (mut session, firewall, _, _wake) = session();
+        session.settings.backup = Some("gone".to_string());
+        run(&mut session, "set pick fra").unwrap();
+        assert_eq!(session.backup, None);
+        assert!(firewall.stamp().unwrap().starts_with("fra "));
+
+        session.settings.backup = Some("fra".to_string());
+        run(&mut session, "set pick fra").unwrap();
+        assert_eq!(session.backup, None, "the pick can't be its own backup");
+    }
+
+    #[test]
+    fn changing_the_default_backup_writes_no_filters() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        run(&mut session, "set config backup waw").unwrap();
+        assert_eq!(writes(&firewall), 1);
+        assert_eq!(session.backup, None, "it waits for the next pick");
+    }
+
+    #[test]
+    fn set_config_validates_and_reports() {
+        let (mut session, _, _, _wake) = session();
+        let output = run(&mut session, "set config ping_every 30").unwrap();
+        assert_eq!(output, Output::line("ping_every = 30".to_string()));
+        assert_eq!(session.settings.ping_every, 30);
+        assert!(
+            run(&mut session, "set config ping_every 999")
+                .unwrap_err()
+                .contains("0 to 300")
+        );
+        assert_eq!(session.settings.ping_every, 30);
+        assert!(
+            run(&mut session, "set config backup nope")
+                .unwrap_err()
+                .contains("unknown server 'nope'")
+        );
+        assert_eq!(session.settings.backup, None);
+    }
+
+    #[test]
+    fn show_config_returns_typed_rows() {
+        let (mut session, _, _, _wake) = session();
+        let Output::Config(rows) = run(&mut session, "show config").unwrap() else {
+            panic!();
+        };
+        assert!(rows.iter().any(|row| row.key == "hold_in_game"));
+        let lines = Output::Config(rows).render();
+        assert!(lines.iter().any(|line| line.starts_with("ping_every")));
+    }
+
+    #[test]
+    fn clear_config_restores_one_or_all() {
+        let (mut session, _, _, _wake) = session();
+        run(&mut session, "set config ping_every 30").unwrap();
+        run(&mut session, "set config report_every 60").unwrap();
+        run(&mut session, "clear config ping_every").unwrap();
+        assert_eq!(session.settings.ping_every, 5);
+        assert_eq!(session.settings.report_every, 60);
+        run(&mut session, "clear config").unwrap();
+        assert_eq!(session.settings, Settings::default());
+    }
+
+    #[test]
+    fn settings_changes_reach_what_they_control() {
+        let (mut session, _, _, wake) = session();
+        let (control, controls) = channel();
+        session.control = Some(control);
+
+        run(&mut session, "set config ping_every 30").unwrap();
+        assert!(matches!(controls.try_recv(), Ok(Control::PingEvery(30))));
+
+        run(&mut session, "set config log_path D:\\a b\\console.log").unwrap();
+        assert!(matches!(
+            controls.try_recv(),
+            Ok(Control::LogPath(Some(path))) if path == "D:\\a b\\console.log"
+        ));
+
+        run(&mut session, "set config refresh_minutes 0").unwrap();
+        assert!(matches!(wake.try_recv(), Ok(Wake::Interval(0))));
+
+        run(&mut session, "set config report_every 42").unwrap();
+        run(&mut session, "start report").unwrap();
+        assert_eq!(
+            session.report.as_ref().unwrap().every,
+            Duration::from_secs(42)
+        );
+        run(&mut session, "set config report_every 7").unwrap();
+        assert_eq!(
+            session.report.as_ref().unwrap().every,
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn the_monitor_follows_the_pick_and_only_hears_changes() {
+        let (mut session, _, _, _wake) = session();
+        let (control, controls) = channel();
+        session.control = Some(control);
+        run(&mut session, "set pick fra").unwrap();
+        let Ok(Control::Targets { pick, ips }) = controls.try_recv() else {
+            panic!("the monitor should hear the pick");
+        };
+        assert_eq!(pick, "fra");
+        assert_eq!(ips.len(), 2);
+        run(&mut session, "set pick fra").unwrap();
+        session.relays(pops());
+        assert!(controls.try_recv().is_err(), "nothing changed");
+        run(&mut session, "clear pick").unwrap();
+        let Ok(Control::Targets { pick, ips }) = controls.try_recv() else {
+            panic!("the monitor should hear the clear");
+        };
+        assert!(pick.is_empty() && ips.is_empty());
+    }
+
+    #[test]
+    fn the_console_can_open_without_starting_the_report() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set config report_on_open off").unwrap();
+        run(&mut session, "toggle console").unwrap();
+        assert!(session.report.is_none());
+        assert!(!firewall.0.watching.load(Ordering::Relaxed));
+    }
+
+    fn changed_relays() -> Pops {
+        let mut changed = pops();
+        changed.remove("waw");
+        changed
+    }
+
+    #[test]
+    fn hold_in_game_delays_a_background_rewrite_until_the_game_closes() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set config hold_in_game on").unwrap();
+        run(&mut session, "set pick fra").unwrap();
+        session.game_running = || true;
+        session.relays(changed_relays());
+        assert_eq!(writes(&firewall), 1, "held while the game runs");
+        session.game_running = || false;
+        session.relays(changed_relays());
+        assert_eq!(writes(&firewall), 2, "applied once it's closed");
+    }
+
+    #[test]
+    fn hold_in_game_never_delays_a_pick() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set config hold_in_game on").unwrap();
+        session.game_running = || true;
+        run(&mut session, "set pick fra").unwrap();
+        run(&mut session, "set pick waw").unwrap();
+        assert_eq!(writes(&firewall), 2);
+        run(&mut session, "clear pick").unwrap();
+        assert_eq!(firewall.stamp(), None);
+    }
+
+    #[test]
+    fn hold_in_game_still_repairs_missing_filters() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set config hold_in_game on").unwrap();
+        run(&mut session, "set pick fra").unwrap();
+        session.game_running = || true;
+        firewall.clear().unwrap();
+        session.relays(pops());
+        assert!(firewall.stamp().is_some(), "the block must come back");
+    }
+
+    #[test]
+    fn hold_in_game_off_ignores_the_game() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        session.game_running = || true;
+        session.relays(changed_relays());
+        assert_eq!(writes(&firewall), 2);
+    }
+
+    #[test]
+    fn quit_can_clear_the_block_first() {
+        let (mut session, firewall, host, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        run(&mut session, "set config clear_on_exit on").unwrap();
+        run(&mut session, "quit").unwrap();
+        assert_eq!(firewall.stamp(), None);
+        assert!(host.quit.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn quit_leaves_the_block_by_default() {
+        let (mut session, firewall, host, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        run(&mut session, "quit").unwrap();
+        assert!(firewall.stamp().is_some());
+        assert!(host.quit.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn analyze_log_reports_on_the_configured_file() {
+        let (mut session, _, _, _wake) = session();
+        let path = std::env::temp_dir().join(format!("dl-rs-log-{}.log", std::process::id()));
+        std::fs::write(
+            &path,
+            "11/05 18:46:43 [SteamNetSockets] [#1 SDR server vport 0] Selecting fra#1 (1.1.1.1:1) as primary.  (Ping = 40 = 39+1+0 (front+interior+remote).  Rank=1 Score=1)\n",
+        )
+        .unwrap();
+        session.settings.log_path = Some(path.display().to_string());
+        session.pick = "fra".to_string();
+        let Output::Lines(lines) = run(&mut session, "analyze log").unwrap() else {
+            panic!();
+        };
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            lines
+                .join("\n")
+                .contains("Primary relay fra#1 is on your pick")
+        );
+    }
+
+    #[test]
+    fn analyze_log_explains_a_missing_file() {
+        let (mut session, _, _, _wake) = session();
+        session.settings.log_path = Some(r"Z:\no\such\console.log".to_string());
+        let error = run(&mut session, "analyze log").unwrap_err();
+        assert!(error.contains(r"Z:\no\such\console.log"), "{error}");
+    }
+
+    #[test]
+    fn the_guide_is_a_command() {
+        let (mut session, _, _, _wake) = session();
+        let Output::Lines(lines) = run(&mut session, "show guide").unwrap() else {
+            panic!();
+        };
+        assert!(lines.join("\n").contains("CUSTOM GAME"));
+    }
+
+    #[test]
+    fn status_carries_the_counters() {
+        let (mut session, _, _, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        session.monitor.direct = Direct::Ms(40);
+        let status = session.status();
+        assert_eq!(status.monitor.direct, Direct::Ms(40));
+        let lines = Output::Status(status).render();
+        assert!(lines.iter().any(|line| line.starts_with("Direct: 40 ms")));
+        assert!(lines.iter().any(|line| line.starts_with("ExitLag route:")));
     }
 
     #[test]

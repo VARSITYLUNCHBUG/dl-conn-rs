@@ -1,16 +1,26 @@
 //! Snapshots behind the diagnostic commands: running processes, routes and relay latency.
 
+use crate::analysis::{self, Context};
 use crate::from_wide;
 use crate::sdr::{Pops, blocklist};
 use crate::wfp::DROPS;
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::mem::{size_of, zeroed};
 use std::net::Ipv4Addr;
-use std::ptr::null;
+use std::os::windows::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::NetworkManagement::IpHelper::*;
 use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_INET};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
+use windows_sys::w;
 
 const WATCHED: [&str; 8] = [
     "deadlock.exe",
@@ -22,6 +32,20 @@ const WATCHED: [&str; 8] = [
     "steam.exe",
     "exitlag.exe",
 ];
+/// Games whose relay traffic dl-rs affects. A running one means a match may be live.
+const GAMES: [&str; 6] = [
+    "deadlock.exe",
+    "project8.exe",
+    "cs2.exe",
+    "dota2.exe",
+    "hl2.exe",
+    "tf_win64.exe",
+];
+const DEADLOCK_LOG: &str = r"steamapps\common\Deadlock\game\citadel\console.log";
+const DEFAULT_STEAM: &str = r"C:\Program Files (x86)\Steam";
+/// The end of the log holds the current session, and this keeps a forgotten log from stalling
+/// commands while it's read.
+const MAX_LOG_BYTES: u64 = 16 << 20;
 const PING_TIMEOUT_MS: u32 = 800;
 const IP_REQ_TIMED_OUT: u32 = 11010;
 /// Same size as ping.exe's default payload.
@@ -77,7 +101,7 @@ pub fn routes(ips: &[Ipv4Addr]) -> Vec<String> {
 }
 
 /// Pings relays at once so a dead one can't stall the result, best first.
-fn probe(ips: &[Ipv4Addr]) -> Vec<(Result<u32, u32>, Ipv4Addr)> {
+pub fn probe(ips: &[Ipv4Addr]) -> Vec<(Result<u32, u32>, Ipv4Addr)> {
     let mut rows: Vec<_> = std::thread::scope(|scope| {
         let probes: Vec<_> = ips
             .iter()
@@ -115,28 +139,135 @@ fn drops(pops: &Pops) -> Vec<String> {
 }
 
 pub fn processes() -> String {
+    let Some(running) = running() else {
+        return "unavailable".into();
+    };
+    let found: Vec<String> = running
+        .iter()
+        .filter(|(name, _)| WATCHED.contains(&name.to_lowercase().as_str()))
+        .map(|(name, id)| format!("{name}#{id}"))
+        .collect();
+    if found.is_empty() {
+        return "none watched".into();
+    }
+    found.join("  ")
+}
+
+pub fn exitlag_running() -> bool {
+    any_running(&["exitlag.exe"])
+}
+
+pub fn game_running() -> bool {
+    any_running(&GAMES)
+}
+
+fn any_running(names: &[&str]) -> bool {
+    running().is_some_and(|running| {
+        running
+            .iter()
+            .any(|(name, _)| names.contains(&name.to_lowercase().as_str()))
+    })
+}
+
+/// Every running process's name and id.
+fn running() -> Option<Vec<(String, u32)>> {
     let mut found = Vec::new();
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
-            return "unavailable".into();
+            return None;
         }
         let mut entry: PROCESSENTRY32W = zeroed();
         entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
         let mut more = Process32FirstW(snapshot, &mut entry) != 0;
         while more {
-            let name = from_wide(&entry.szExeFile);
-            if WATCHED.contains(&name.to_lowercase().as_str()) {
-                found.push(format!("{name}#{}", entry.th32ProcessID));
-            }
+            found.push((from_wide(&entry.szExeFile), entry.th32ProcessID));
             more = Process32NextW(snapshot, &mut entry) != 0;
         }
         CloseHandle(snapshot);
     }
-    if found.is_empty() {
-        return "none watched".into();
+    Some(found)
+}
+
+/// Opens a file the game may hold open, or rewrite, while it's being read.
+pub fn open_shared(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+}
+
+/// Steam's install folder, as Steam recorded it.
+fn steam_folder() -> Option<String> {
+    let mut buffer = [0u16; 1024];
+    let mut size = size_of::<[u16; 1024]>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Valve\\Steam"),
+            w!("SteamPath"),
+            RRF_RT_REG_SZ,
+            null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    (status == 0).then(|| from_wide(&buffer).replace('/', "\\"))
+}
+
+/// The game's log: the configured path if there is one, otherwise Deadlock's log in any library.
+pub fn find_log(configured: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(path) = configured {
+        let path = PathBuf::from(path);
+        return if path.is_file() {
+            Ok(path)
+        } else {
+            Err(format!(
+                "No log at {}. Check the game log path in F2.",
+                path.display()
+            ))
+        };
     }
-    found.join("  ")
+    let steam = steam_folder().unwrap_or_else(|| DEFAULT_STEAM.to_string());
+    let mut libraries = vec![steam.clone()];
+    let folders = Path::new(&steam).join(r"steamapps\libraryfolders.vdf");
+    if let Ok(vdf) = fs::read_to_string(folders) {
+        libraries.extend(analysis::libraries(&vdf));
+    }
+    libraries
+        .iter()
+        .map(|library| Path::new(library).join(DEADLOCK_LOG))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "Deadlock's console.log wasn't found. Add -condebug to its launch options and run \
+             the game once. F1 has the steps. For another game, set the game log path in F2."
+                .to_string()
+        })
+}
+
+/// Reads the log, or the end of a very large one, and describes the file.
+pub fn read_log(configured: Option<&str>) -> Result<(String, Context), String> {
+    let path = find_log(configured)?;
+    let describe = |error: io::Error| format!("Can't read {}: {error}", path.display());
+    let mut file = open_shared(&path).map_err(describe)?;
+    let metadata = file.metadata().map_err(describe)?;
+    let bytes = metadata.len();
+    let start = bytes.saturating_sub(MAX_LOG_BYTES);
+    file.seek(SeekFrom::Start(start)).map_err(describe)?;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw).map_err(describe)?;
+    let context = Context {
+        path: path.display().to_string(),
+        bytes,
+        truncated: start > 0,
+        age_secs: metadata
+            .modified()
+            .ok()
+            .and_then(|written| written.elapsed().ok())
+            .map(|age| age.as_secs()),
+        ..Context::default()
+    };
+    Ok((String::from_utf8_lossy(&raw).into_owned(), context))
 }
 
 /// The OS's chosen path to a relay: interface alias and next hop.

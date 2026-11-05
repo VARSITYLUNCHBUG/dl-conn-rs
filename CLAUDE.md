@@ -1,7 +1,7 @@
 # dl-rs
 
 Picks one Steam relay site and blocks the rest until reboot, alongside ExitLag. Rust, Win32, one
-admin exe, target under 500 KB. See `README.md` for what it does and `docs/roadmap.md` for what's
+admin exe, target under 500 KB (about 590 KB now, see Open items). See `README.md` for what it does and `docs/roadmap.md` for what's
 next.
 
 ## Rules
@@ -11,8 +11,11 @@ next.
 - **Crates:** `windows-sys` and `miniserde` only. Ask before adding one.
 - **UI text:** plain ASCII. No emoji or em dashes. `scripts/check.ps1` enforces this across `src/`.
 - **State:** the active pick lives in WFP, not in memory or on disk. It's recovered from the stamp.
+  Only user settings go to disk, in `%LOCALAPPDATA%\dl-rs\settings.ini`.
 - **Failure:** bad data or a failed fetch never lifts a block or shrinks the relay set.
-- **Overhead:** no per-packet work, no polling while idle, and diagnostics only while requested.
+- **Overhead:** no per-packet work, and diagnostics only while requested. The one exception is the
+  counters: one ping per `ping_every` while there's a pick, and a process check every 5 s. The game's
+  log is only read while ExitLag runs.
 - **Git:** local only, no remote. Commit only when asked. This machine has no git identity, so pass
   `-c user.name=VARSITYLUNCHBUG -c user.email=100867870+VARSITYLUNCHBUG@users.noreply.github.com`.
 - **No Claude signature in any commit**, in the message or the identity. Never use `--no-verify` to
@@ -23,11 +26,11 @@ next.
 ## Architecture
 
 ```
-dropdown --+  command lines
-           +--> command.rs parses --> session.rs --> wfp / sdr / diag
-console ---+                               |
-    ^             log.rs <---- lines ------+
-    +------ reads --+                      +-- "changed" --> dropdown queries again
+windows ---+  command lines
+           +--> command.rs parses --> session.rs --> wfp / sdr / diag / analysis
+console ---+                               |   ^
+    ^             log.rs <---- lines ------+   +-- counters <-- monitor.rs thread
+    +------ reads --+                      +-- "changed" --> windows query again
 ```
 
 | File | Purpose |
@@ -37,8 +40,17 @@ console ---+                               |
 | `src/log.rs` | Capped log buffer that wakes the console |
 | `src/editor.rs` | Console input line as pure state |
 | `src/console.rs` | Real console and its single I/O thread |
-| `src/ui.rs` | Dropdown only. `build_view` and `title` are pure |
-| `src/diag.rs` | Processes, routes and latency, returned as lines |
+| `src/ui/rows.rs` | What the main window shows. Pure |
+| `src/ui/dropdown.rs` | The searchable dropdown's Win32 wrapper |
+| `src/ui/text_window.rs` | F1 and F3 |
+| `src/ui/settings_window.rs` | F2 |
+| `src/ui/mod.rs` | Main window, message loop and hotkeys |
+| `src/settings.rs` | Setting definitions and validation, plus load and save |
+| `src/analysis.rs` | Log parser, findings and report. Pure |
+| `src/monitor.rs` | The counters' thread. Its hold logic and labels are pure |
+| `src/regions.rs` | Site code to region table. Pure |
+| `src/guide.rs` | The F1 text |
+| `src/diag.rs` | Processes, routes, latency and finding the game's log |
 | `src/wfp.rs` | Filters and drop events |
 | `src/sdr.rs` | Relay lists, and working out what to block |
 | `examples/loadsim.rs` | Rate-capped, game-shaped UDP for tests. Not in the app |
@@ -59,6 +71,9 @@ The session's PATH may not include cargo. Use `$HOME/.cargo/bin`, or the script 
 powershell -ExecutionPolicy Bypass -File scripts/check.ps1
 powershell -ExecutionPolicy Bypass -File scripts/game-log.ps1
 ```
+
+`scripts/ui-test.ps1` drives the real windows with a fake firewall, with no admin rights or UAC prompt.
+It can't change a block, so it's safe with a game running. Real mouse input is in the live test.
 
 `check.ps1` runs format, ASCII, clippy, unit tests and a release build. A running dl-rs locks
 `target/release/dl-rs.exe`, so it builds to `target/next` instead, and it doesn't close the app.
@@ -90,8 +105,19 @@ powershell -ExecutionPolicy Bypass -File scripts/game-log.ps1
   means a local filter refused it.
 - `netsh wfp show netevents` returned zero drops for `deadlock.exe` while blocks were clearly
   active, so don't rely on that parser without validating it.
+- A test exe has no manifest, so it gets old common controls and no DPI awareness. `ui-test.ps1` puts
+  a copy of `app.manifest` beside it.
 - PowerShell: `Echo` is an alias that shadows a function of that name, and `$null` passed to a
   `[string]` P/Invoke becomes `""`. Use `[NullString]::Value`.
+
+**Win32**
+- In a `CBS_DROPDOWN`, any change to the edit text clears the list's highlight, and `CB_SETCURSEL`
+  overwrites the text. To highlight a row while keeping typed text, set the text first, then send
+  `LB_SETCURSEL` to the list from `GetComboBoxInfo`.
+- `GetWindowText` can't read another process's controls. Scripts must send `WM_GETTEXT`.
+- Hovering an open list changes `CB_GETCURSEL`. Clicking away puts it back before `CBN_CLOSEUP`, so
+  commit-on-close is safe. An open list also covers the window below the dropdown, so a script's
+  "click away" must use the title bar.
 
 **Valve data**
 - `geo` is unreliable: Datapacket sites have latitude and longitude swapped. Classify known sites
@@ -105,9 +131,16 @@ powershell -ExecutionPolicy Bypass -File scripts/game-log.ps1
   relays.
 - Without a block, `Ping location` in the log lists sites with direct measurements. With a strict
   block, only the pick has one, and the rest appear as `code=/ms+penalty`.
+- `[Networking] Summary of connection` blocks hold each connection's loss, jitter and ping
+  percentiles. The first set is this PC's. A second set, "received from remote host", is the far end's.
+- Hideout connections are `UDP` to `127.0.0.1` or `pipe`. A private lobby ready-up was followed by an
+  `SDR` connection in the one log checked, so custom games appear to use relays.
 
 ## Open items
 
+- The release exe is about 590 KB, over the 500 KB target. Raise the target or cut features.
+- `hold_in_game` is unit tested only. It needs a relay list change while a game runs.
+- The route counter hasn't been seen against a live boosted match yet.
 - `--backup` is written and unit tested, but not yet confirmed against the game.
 - In a match under a strict Singapore block, the game ran 7 minutes with no backup, then logged
   `Selecting tyo#172 as backup #1` at 18:53:54, 8 s before the player left. Most likely the block

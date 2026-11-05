@@ -7,13 +7,18 @@ macro_rules! log {
     ($($arg:tt)*) => { $crate::log::line(format!($($arg)*)) };
 }
 
+mod analysis;
 mod command;
 mod console;
 mod diag;
 mod editor;
+mod guide;
 mod log;
+mod monitor;
+mod regions;
 mod sdr;
 mod session;
+mod settings;
 pub mod ui;
 mod wfp;
 

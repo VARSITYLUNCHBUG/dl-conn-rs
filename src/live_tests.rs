@@ -183,3 +183,18 @@ fn survives_exit_part2() {
 fn clear_any_block() {
     Engine::open().unwrap().clear().unwrap();
 }
+
+/// Prints the report for the log on this PC. Read-only and needs no admin, so it's safe in a match.
+#[test]
+#[ignore = "reads the real game log; run by hand"]
+fn prints_the_report_for_the_real_log() {
+    let (text, context) = crate::diag::read_log(None).unwrap();
+    let context = crate::analysis::Context {
+        pick: std::env::var("DLRS_PICK").unwrap_or_default(),
+        ..context
+    };
+    let log = crate::analysis::parse(&text);
+    for line in crate::analysis::report(&log, &context) {
+        println!("{line}");
+    }
+}

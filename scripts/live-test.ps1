@@ -10,6 +10,9 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $OutDir | Out-Null
+# Settings this test changes stay in its output folder, away from the real ones.
+$env:LOCALAPPDATA = Join-Path (Resolve-Path $OutDir).Path 'appdata'
+New-Item -ItemType Directory -Force $env:LOCALAPPDATA | Out-Null
 $log = Join-Path $OutDir 'results.txt'
 Set-Content $log "started $(Get-Date)"
 function Note($text) { Add-Content $log $text }
@@ -137,9 +140,10 @@ try {
     for ($i = 0; $i -lt 20; $i++) { UdpSend $shut; Start-Sleep -Seconds 1 }
     $text = Screen
     Set-Content (Join-Path $OutDir 'console-log.txt') $text
-    Check 'history replayed from before it opened' ($text -match 'start: active pick')
+    Check 'history replayed from before it opened' ($text -match 'start: active')
     Check 'dropdown choice was logged as a command' ($text -match "> set pick $openCode")
-    Check 'report shows processes' ($text -match 'processes: .*ExitLag')
+    $expected = if (Get-Process ExitLag -ErrorAction SilentlyContinue) { 'processes: .*ExitLag' } else { 'processes: \S' }
+    Check 'report shows processes' ($text -match $expected)
     Check 'report shows picking' ($text -match "picking: $openCode")
     Check 'report shows routes' ($text -match 'via .* gw ')
     Check 'report shows UDP drops' ($text -match "blocked .* -> $shutCode")
@@ -210,7 +214,7 @@ try {
     Keys $ESC
     Keys "stop report`r"
     Keys "clear screen`r" 800
-    Check 'clear screen clears' (-not ((Screen) -match 'start: active pick'))
+    Check 'clear screen clears' (-not ((Screen) -match 'start: active'))
     Check 'prompt remains after clearing' ((PromptLine) -eq 'dl-rs>')
 
     Note "--- console: show, hide, quit"
@@ -234,6 +238,106 @@ try {
     Note "title: $title"
     Check 'No block option clears' ($title -match 'no block')
     Check 'relay reachable again' (Ping1 $shut)
+
+    Note "--- search, counters and windows on the real app"
+    $edit = [W]::FindWindowEx($app.Combo, [IntPtr]::Zero, 'Edit', [NullString]::Value)
+    foreach ($c in $openDesc.ToCharArray()) {
+        [void][W]::PostMessage($edit, 0x102, [IntPtr][int]$c, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 30
+    }
+    Start-Sleep -Milliseconds 300
+    [W]::Shot([W]::FindWindow('ComboLBox', [NullString]::Value), (Join-Path $OutDir 'dropdown-search.png'))
+    [void][W]::PostMessage($edit, $WM_KEYDOWN, [IntPtr]0x0D, [IntPtr]::Zero)
+    $title = WaitTitle $app.Hwnd '\d+ blocked'
+    Note "title: $title"
+    Check 'typing and Enter pick a server' ($title.Contains($openDesc))
+    Check 'a searched pick really blocks' (-not (Ping1 $shut))
+    Check 'and keeps the pick open' (Ping1 $open)
+    Start-Sleep -Seconds 7
+    $direct = [W]::Text([W]::GetDlgItem($app.Hwnd, 2))
+    Note "direct: $direct"
+    Note ('route: ' + [W]::Text([W]::GetDlgItem($app.Hwnd, 3)))
+    Check 'the direct counter reports on the pick' ($direct.Contains($openCode))
+    [W]::Shot($app.Hwnd, (Join-Path $OutDir 'main-counters.png'))
+    foreach ($key in @(@(0x70, 'dl-rs-text', 'f1'), @(0x71, 'dl-rs-settings', 'f2'), @(0x72, 'dl-rs-text', 'f3'))) {
+        [void][W]::PostMessage($app.Combo, $WM_KEYDOWN, [IntPtr]$key[0], [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 1500
+        $window = [W]::FindWindow($key[1], [NullString]::Value)
+        Check "$($key[2]) opens its window" ($window -ne [IntPtr]::Zero)
+        [W]::Shot($window, (Join-Path $OutDir "$($key[2]).png"))
+        [void][W]::PostMessage($window, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 300
+    }
+    PickItem $app $null
+    $title = WaitTitle $app.Hwnd 'no block'
+    Check 'and No block clears it again' ($title -match 'no block')
+
+    Note "--- real mouse"
+    [void][W]::SetForegroundWindow($app.Hwnd)
+    Start-Sleep -Milliseconds 400
+    function OpenWithMouse {
+        $box = [W]::Rect($app.Combo)
+        [W]::Click($box[2] - 8, [int](($box[1] + $box[3]) / 2))
+        Start-Sleep -Milliseconds 400
+    }
+    # Where a row is on screen, allowing for how far the list has scrolled.
+    function RowPoint($index) {
+        $list = [W]::Rect([W]::FindWindow('ComboLBox', [NullString]::Value))
+        $top = [int][W]::SendMessage($app.Combo, 0x15B, [IntPtr]::Zero, [IntPtr]::Zero)
+        $height = [int][W]::SendMessage($app.Combo, 0x154, [IntPtr]::Zero, [IntPtr]::Zero)
+        return @(($list[0] + 60), ($list[1] + 1 + ($index - $top) * $height + [int]($height / 2)))
+    }
+    $labels = 0..([int][W]::SendMessage($app.Combo, $CB_GETCOUNT, [IntPtr]::Zero, [IntPtr]::Zero) - 1) | ForEach-Object { [W]::Item($app.Combo, $_) }
+    $africa = [array]::IndexOf($labels, 'Africa')
+
+    OpenWithMouse
+    $point = RowPoint $africa
+    [W]::Click($point[0], $point[1])
+    Start-Sleep -Milliseconds 600
+    Check 'clicking a header picks nothing' ([W]::Title($app.Hwnd) -match 'no block')
+    Check 'and leaves the selection alone' ([W]::Selected($app.Combo) -like 'No block*')
+    if ([int][W]::SendMessage($app.Combo, 0x157, [IntPtr]::Zero, [IntPtr]::Zero) -ne 0) {
+        [void][W]::SendMessage($app.Combo, $CB_SHOWDROPDOWN, [IntPtr]::Zero, [IntPtr]::Zero)
+    }
+
+    OpenWithMouse
+    [W]::Shot([W]::FindWindow('ComboLBox', [NullString]::Value), (Join-Path $OutDir 'dropdown-mouse.png'))
+    $point = RowPoint ($africa + 1)
+    [W]::Click($point[0], $point[1])
+    $title = WaitTitle $app.Hwnd 'Johannesburg'
+    Note "title: $title"
+    Check 'clicking a server picks it' ($title -match 'Johannesburg')
+
+    OpenWithMouse
+    $point = RowPoint ($africa + 3)
+    [W]::Move($point[0], $point[1])
+    Start-Sleep -Milliseconds 300
+    # The title bar, because the open list covers everything below the dropdown.
+    $frame = [W]::Rect($app.Hwnd)
+    [W]::Click([int](($frame[0] + $frame[2]) / 2), $frame[1] + 10)
+    Start-Sleep -Milliseconds 600
+    Check 'hovering then clicking away changes nothing' ([W]::Title($app.Hwnd) -match 'Johannesburg')
+    Check 'and the box still shows the pick' ([W]::Selected($app.Combo).Contains('jnb'))
+
+    Note "--- clear_on_exit"
+    [void][W]::PostMessage($app.Combo, $WM_KEYDOWN, [IntPtr]0x71, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 1500
+    $form = [W]::FindWindow('dl-rs-settings', [NullString]::Value)
+    $exit = [W]::GetDlgItem($form, 106)
+    Check 'the setting is on the form' ($exit -ne [IntPtr]::Zero)
+    [void][W]::SendMessage($exit, $CB_SETCURSEL, [IntPtr]::Zero, [IntPtr]::Zero)
+    [void][W]::SendMessage($form, 0x111, [IntPtr](106 -bor (1 -shl 16)), $exit)
+    Start-Sleep -Milliseconds 800
+    Check 'it saves' ((Get-Content (Join-Path $env:LOCALAPPDATA 'dl-rs\settings.ini') -Raw) -match 'clear_on_exit=on')
+    [void][W]::PostMessage($form, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 300
+    Check 'the block is on before closing' (-not (Ping1 $shut))
+    [void][W]::PostMessage($app.Hwnd, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
+    Check 'the X button closes the app' ($app.Proc.WaitForExit(5000))
+    Check 'clear_on_exit removed the block' (Ping1 $shut)
+    $app = StartApp
+    $title = WaitTitle $app.Hwnd 'no block'
+    Check 'a reopened app finds no block' ($title -match 'no block')
     $app.Proc.Kill(); $app.Proc.WaitForExit()
 }
 catch {

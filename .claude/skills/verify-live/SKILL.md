@@ -16,6 +16,7 @@ tasklist | grep -i -E "deadlock|dl-rs|exitlag"
 | --- | --- | --- | --- |
 | Which relay is the game on? What's the route ping? | `scripts/game-log.ps1` | No | Yes |
 | Do logic and formatting hold? | `scripts/check.ps1` | No | Yes |
+| Do the windows, dropdown search and F keys work? | `scripts/ui-test.ps1` (fake firewall) | No | Yes |
 | Does the block hold in the current match? | `load-sim.ps1 -Scenario probe -Pick <server>` | Yes | Only if `<server>` is the match's server |
 | Does a boosted game's traffic get caught? | `load-sim.ps1 -Scenario game -ExeName deadlock.exe` | Yes | Disruptive, ask first |
 | Are filters, console and dropdown all correct? | `scripts/live-test.ps1` | Yes | No, it switches picks |

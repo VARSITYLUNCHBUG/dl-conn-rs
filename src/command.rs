@@ -3,6 +3,8 @@
 //! One table drives parsing, help and completion, so they can't disagree. Nothing here touches
 //! Windows or app state.
 
+use crate::settings;
+
 /// A relay site's code and name, as offered by completion.
 pub type ServerName = (String, String);
 
@@ -38,6 +40,16 @@ pub enum Command {
     StopReport,
     ToggleConsole,
     ClearScreen,
+    ShowConfig,
+    SetConfig {
+        key: String,
+        value: String,
+    },
+    ClearConfig {
+        key: Option<String>,
+    },
+    AnalyzeLog,
+    ShowGuide,
     Quit,
 }
 
@@ -46,6 +58,12 @@ enum Param {
         required: bool,
     },
     Topic,
+    /// A setting's name.
+    Key {
+        required: bool,
+    },
+    /// Everything after the key, exactly as typed, so a path keeps its case and spaces.
+    Value,
     Option {
         name: &'static str,
         value: &'static str,
@@ -57,6 +75,8 @@ enum Param {
 struct Args {
     server: Option<String>,
     topic: Option<String>,
+    key: Option<String>,
+    value: Option<String>,
     options: Vec<(&'static str, String)>,
 }
 
@@ -131,7 +151,7 @@ static COMMANDS: &[Spec] = &[
             Param::Option {
                 name: "--backup",
                 value: SERVER_VALUE,
-                about: "Also keep this server open, so the game has a failover relay",
+                about: "Also keep this server open for failover. none skips the default backup",
             },
         ],
         summary: "Block every relay except this server's",
@@ -236,6 +256,46 @@ static COMMANDS: &[Spec] = &[
         build: |_| Ok(Command::ToggleConsole),
     },
     Spec {
+        verb: "show",
+        noun: "config",
+        params: &[],
+        summary: "Show every setting and what it does",
+        build: |_| Ok(Command::ShowConfig),
+    },
+    Spec {
+        verb: "set",
+        noun: "config",
+        params: &[Param::Key { required: true }, Param::Value],
+        summary: "Change a setting and save it",
+        build: |args| {
+            Ok(Command::SetConfig {
+                key: args.key.unwrap_or_default(),
+                value: args.value.unwrap_or_default(),
+            })
+        },
+    },
+    Spec {
+        verb: "clear",
+        noun: "config",
+        params: &[Param::Key { required: false }],
+        summary: "Put one setting, or all of them, back to the default",
+        build: |args| Ok(Command::ClearConfig { key: args.key }),
+    },
+    Spec {
+        verb: "analyze",
+        noun: "log",
+        params: &[],
+        summary: "Read the game's log and report on its relay connections",
+        build: |_| Ok(Command::AnalyzeLog),
+    },
+    Spec {
+        verb: "show",
+        noun: "guide",
+        params: &[],
+        summary: "Show how to test a connection, step by step",
+        build: |_| Ok(Command::ShowGuide),
+    },
+    Spec {
         verb: "quit",
         noun: "",
         params: &[],
@@ -261,6 +321,9 @@ impl Spec {
                 Param::Server { required: true } => "<server>".to_string(),
                 Param::Server { required: false } => "[<server>]".to_string(),
                 Param::Topic => "[verb [noun]]".to_string(),
+                Param::Key { required: true } => "<key>".to_string(),
+                Param::Key { required: false } => "[<key>]".to_string(),
+                Param::Value => "<value>".to_string(),
                 Param::Option { name, value, .. } => format!("[{name} {value}]"),
             });
         }
@@ -280,6 +343,12 @@ impl Spec {
                     );
                 }
                 Param::Topic => {}
+                Param::Key { .. } => {
+                    lines.push("  <key>  A setting from 'show config'".to_string());
+                }
+                Param::Value => {
+                    lines.push("  <value>  'show config' lists what each one allows".to_string());
+                }
                 Param::Option { name, value, about } => {
                     lines.push(format!("  {name} {value}  {about}"));
                 }
@@ -322,6 +391,14 @@ pub fn parse(line: &str) -> Result<Command, String> {
         return Err(unknown_command(&words));
     };
     let mut args = Args::default();
+    let takes_value = spec
+        .params
+        .iter()
+        .any(|param| matches!(param, Param::Value));
+    let takes_key = spec
+        .params
+        .iter()
+        .any(|param| matches!(param, Param::Key { .. }));
     let mut rest = words[used..].iter();
     if spec
         .params
@@ -346,6 +423,16 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 return Err(format!("{name} needs {value}. Usage: {}", spec.usage()));
             };
             args.options.push((name, given.clone()));
+        } else if takes_key && args.key.is_none() {
+            if !settings::is_key(word) {
+                return Err(format!("unknown setting '{word}'. Try 'show config'"));
+            }
+            args.key = Some(word.clone());
+            if takes_value {
+                let value = after_words(line, used + 1);
+                args.value = (!value.is_empty()).then(|| value.to_string());
+                break;
+            }
         } else if takes_server && args.server.is_none() && !word.starts_with("--") {
             args.server = Some(word.clone());
         } else {
@@ -359,7 +446,27 @@ pub fn parse(line: &str) -> Result<Command, String> {
     if needs_server && args.server.is_none() {
         return Err(format!("missing <server>. Usage: {}", spec.usage()));
     }
+    let needs_key = spec
+        .params
+        .iter()
+        .any(|param| matches!(param, Param::Key { required: true }));
+    if needs_key && args.key.is_none() {
+        return Err(format!("missing <key>. Usage: {}", spec.usage()));
+    }
+    if takes_value && args.value.is_none() {
+        return Err(format!("missing <value>. Usage: {}", spec.usage()));
+    }
     (spec.build)(args)
+}
+
+/// The text after the first `count` words, as typed.
+fn after_words(line: &str, count: usize) -> &str {
+    let mut rest = line.trim();
+    for _ in 0..count {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = rest[end..].trim_start();
+    }
+    rest
 }
 
 fn unknown_command(words: &[String]) -> String {
@@ -556,10 +663,47 @@ fn arguments(previous: &[String], word: &str, servers: &[ServerName]) -> Vec<Can
             Param::Server { .. } if !word.starts_with('-') && !has_server(spec, given) => {
                 candidates.extend(matching_servers(word, servers));
             }
+            Param::Key { .. } if given.is_empty() => {
+                candidates.extend(
+                    settings::names()
+                        .filter(|(name, _)| name.starts_with(word))
+                        .map(|(name, title)| Candidate {
+                            text: name.to_string(),
+                            note: title.to_string(),
+                        }),
+                );
+            }
+            Param::Value if given.len() == 1 => {
+                candidates.extend(values_for(&given[0], word, servers));
+            }
             _ => {}
         }
     }
     candidates
+}
+
+/// What a setting can be set to, where there's a short list.
+fn values_for(key: &str, word: &str, servers: &[ServerName]) -> Vec<Candidate> {
+    let fixed = |values: &[&str]| -> Vec<Candidate> {
+        values
+            .iter()
+            .filter(|value| value.starts_with(word))
+            .map(|value| Candidate {
+                text: (*value).to_string(),
+                note: String::new(),
+            })
+            .collect()
+    };
+    match settings::kind(key) {
+        Some(settings::Kind::Toggle) => fixed(&["off", "on"]),
+        Some(settings::Kind::Path) => fixed(&["auto"]),
+        Some(settings::Kind::Server) => {
+            let mut values = fixed(&["none"]);
+            values.extend(matching_servers(word, servers));
+            values
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Whether the line already names the server, as opposed to an option's value.
@@ -629,8 +773,11 @@ mod tests {
     fn example(spec: &Spec) -> String {
         let mut line = spec.name();
         for param in spec.params {
-            if let Param::Server { required: true } = param {
-                line.push_str(" fra");
+            match param {
+                Param::Server { required: true } => line.push_str(" fra"),
+                Param::Key { required: true } => line.push_str(" ping_every"),
+                Param::Value => line.push_str(" 5"),
+                _ => {}
             }
         }
         line
@@ -723,6 +870,83 @@ mod tests {
     }
 
     #[test]
+    fn config_commands_keep_a_value_exactly_as_typed() {
+        assert_eq!(
+            parse("set config ping_every 30"),
+            Ok(Command::SetConfig {
+                key: "ping_every".to_string(),
+                value: "30".to_string()
+            })
+        );
+        assert_eq!(
+            parse(r"  SET  Config   LOG_PATH   D:\Steam Games\console.log  "),
+            Ok(Command::SetConfig {
+                key: "log_path".to_string(),
+                value: r"D:\Steam Games\console.log".to_string()
+            })
+        );
+        assert_eq!(parse("show config"), Ok(Command::ShowConfig));
+        assert_eq!(
+            parse("clear config"),
+            Ok(Command::ClearConfig { key: None })
+        );
+        assert_eq!(
+            parse("clear config backup"),
+            Ok(Command::ClearConfig {
+                key: Some("backup".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn config_commands_explain_what_is_wrong() {
+        assert!(parse("set config").unwrap_err().contains("missing <key>"));
+        assert!(
+            parse("set config backup")
+                .unwrap_err()
+                .contains("missing <value>")
+        );
+        assert!(
+            parse("set config nope 1")
+                .unwrap_err()
+                .contains("unknown setting 'nope'")
+        );
+        assert!(
+            parse("clear config nope")
+                .unwrap_err()
+                .contains("unknown setting 'nope'")
+        );
+        assert!(
+            parse("clear config backup extra")
+                .unwrap_err()
+                .contains("unexpected 'extra'")
+        );
+    }
+
+    #[test]
+    fn completes_config_keys_and_values() {
+        assert_eq!(texts("set config ping"), ["ping_every"]);
+        assert_eq!(
+            texts("clear config rep"),
+            ["report_every", "report_on_open"]
+        );
+        assert_eq!(texts("set config hold_in_game "), ["off", "on"]);
+        assert_eq!(texts("set config clear_on_exit o"), ["off", "on"]);
+        assert_eq!(texts("set config log_path "), ["auto"]);
+        assert_eq!(texts("set config backup j"), ["jnb"]);
+        assert_eq!(texts("set config backup no"), ["none"]);
+        assert!(texts("set config ping_every ").is_empty());
+        assert!(texts("set config ping_every 5 ").is_empty());
+    }
+
+    #[test]
+    fn parses_the_report_and_guide_commands() {
+        assert_eq!(parse("analyze log"), Ok(Command::AnalyzeLog));
+        assert_eq!(parse("show guide"), Ok(Command::ShowGuide));
+        assert!(parse("analyze").unwrap_err().contains("analyze log"));
+    }
+
+    #[test]
     fn completes_a_backup_server() {
         assert_eq!(texts("set pick fra --backup j"), ["jnb"]);
         assert_eq!(texts("set pick fra --backup south"), ["jnb"]);
@@ -798,7 +1022,7 @@ mod tests {
     #[test]
     fn completes_help_topics() {
         assert_eq!(texts("help se"), ["set"]);
-        assert_eq!(texts("help set "), ["pick"]);
+        assert_eq!(texts("help set "), ["config", "pick"]);
     }
 
     #[test]
@@ -843,13 +1067,13 @@ mod tests {
         assert!(help_for("set pick").join("\n").contains("<server>"));
         assert!(help_for("start report --ev").join("\n").contains("--every"));
         let partial = help_for("show");
-        assert_eq!(partial.len(), 4, "{partial:?}");
+        assert_eq!(partial.len(), 6, "{partial:?}");
         assert!(help_for("wibble").len() >= COMMANDS.len());
     }
 
     #[test]
     fn help_rejects_unknown_topics() {
         assert!(help(Some("wibble")).is_err());
-        assert_eq!(help(Some("show")).unwrap().len(), 4);
+        assert_eq!(help(Some("show")).unwrap().len(), 6);
     }
 }
