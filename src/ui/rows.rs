@@ -109,12 +109,17 @@ pub fn first_match(rows: &[Row], query: &str) -> Option<usize> {
         .or_else(|| rows.iter().position(|row| !row.is_header()))
 }
 
-/// The nearest row that can be picked, moving away from a header in the direction of travel. The
-/// other direction is the fallback, for a header at the end of the list.
-pub fn skip_header(rows: &[Row], from: usize, forward: bool) -> Option<usize> {
-    let up = (0..from).rev().find(|at| !rows[*at].is_header());
-    let down = (from + 1..rows.len()).find(|at| !rows[*at].is_header());
-    if forward { down.or(up) } else { up.or(down) }
+/// The next row an arrow key lands on, skipping headers and stopping at the ends.
+pub fn step(rows: &[Row], from: Option<usize>, down: bool) -> Option<usize> {
+    let Some(from) = from else {
+        return rows.iter().position(|row| !row.is_header());
+    };
+    let next = if down {
+        (from + 1..rows.len()).find(|at| !rows[*at].is_header())
+    } else {
+        (0..from).rev().find(|at| !rows[*at].is_header())
+    };
+    next.or(Some(from))
 }
 
 pub fn build_view(servers: &[Server], status: &Status) -> View {
@@ -123,7 +128,7 @@ pub fn build_view(servers: &[Server], status: &Status) -> View {
         selected: position(&rows, &status.pick),
         rows,
         title: title(status),
-        direct: monitor::direct_label(&status.pick, &status.monitor.direct),
+        direct: monitor::direct_label(&status.pick, &status.monitor),
         route: monitor::route_label(&status.pick, &status.monitor),
     }
 }
@@ -264,15 +269,18 @@ mod tests {
     }
 
     #[test]
-    fn headers_can_be_skipped_in_either_direction() {
+    fn arrow_keys_skip_headers_and_stop_at_the_ends() {
         let rows = build_rows(&servers(), &status(), "");
-        assert_eq!(rows[3].label, "Asia");
-        assert_eq!(skip_header(&rows, 3, true), Some(4));
-        assert_eq!(skip_header(&rows, 3, false), Some(2));
-        let single = vec![Row::header("Asia")];
-        assert_eq!(skip_header(&single, 0, true), None);
-        let ends = vec![Row::header("Asia"), rows[2].clone()];
-        assert_eq!(skip_header(&ends, 0, false), Some(1), "falls back");
+        assert_eq!(step(&rows, Some(0), true), Some(2), "over Africa");
+        assert_eq!(step(&rows, Some(2), true), Some(4), "over Asia");
+        assert_eq!(step(&rows, Some(4), false), Some(2), "back over Asia");
+        assert_eq!(step(&rows, Some(0), false), Some(0), "the top");
+        assert_eq!(
+            step(&rows, Some(rows.len() - 1), true),
+            Some(rows.len() - 1)
+        );
+        assert_eq!(step(&rows, None, true), Some(0));
+        assert_eq!(step(&[], None, true), None);
     }
 
     #[test]
@@ -354,11 +362,8 @@ mod tests {
                 ..status()
             },
         );
-        assert_eq!(
-            view.direct,
-            "Direct: 180 ms to jnb (this PC, not through ExitLag)"
-        );
-        assert_eq!(view.route, "ExitLag route: not running");
+        assert_eq!(view.direct, "Direct: 180 ms to jnb (ping from this PC)");
+        assert_eq!(view.route, "Game: turn on logging to see this, press F1");
     }
 
     #[test]

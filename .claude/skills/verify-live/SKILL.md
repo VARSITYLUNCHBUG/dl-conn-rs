@@ -16,10 +16,11 @@ tasklist | grep -i -E "deadlock|dl-rs|exitlag"
 | --- | --- | --- | --- |
 | Which relay is the game on? What's the route ping? | `scripts/game-log.ps1` | No | Yes |
 | Do logic and formatting hold? | `scripts/check.ps1` | No | Yes |
-| Do the windows, dropdown search and F keys work? | `scripts/ui-test.ps1` (fake firewall) | No | Yes |
+| Do the dropdown, keys and pages behave? | `cargo test` (`src/ui/tests.rs`) | No | Yes |
+| Does the real window open, draw and idle properly? | `scripts/window-check.ps1` (fake firewall) | No | Yes |
 | Does the block hold in the current match? | `load-sim.ps1 -Scenario probe -Pick <server>` | Yes | Only if `<server>` is the match's server |
 | Does a boosted game's traffic get caught? | `load-sim.ps1 -Scenario game -ExeName deadlock.exe` | Yes | Disruptive, ask first |
-| Are filters, console and dropdown all correct? | `scripts/live-test.ps1` | Yes | No, it switches picks |
+| Are filters, console and dropdown all correct? | `scripts/live-test.ps1` (moves the mouse) | Yes | No, it switches picks |
 | Is block accounting exact under load? | `scripts/load-sim.ps1` | Yes | No, it switches picks |
 
 The guard hook refuses scripts that switch picks while Deadlock is running.

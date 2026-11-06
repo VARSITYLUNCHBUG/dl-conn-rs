@@ -3,6 +3,7 @@
 //! Only settings that change real behaviour belong here. The active pick is not one of them: it
 //! lives in WFP. Everything except `load` and `save` is pure.
 
+use crate::diag;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ pub enum Kind {
     Toggle,
     Server,
     Path,
+    Theme,
 }
 
 struct Key {
@@ -79,6 +81,13 @@ const KEYS: &[Key] = &[
         about: "Removes the block when dl-rs closes. Off leaves it on until reboot or the next pick.",
     },
     Key {
+        name: "theme",
+        title: "Theme",
+        kind: Kind::Theme,
+        allowed: "system, light or dark",
+        about: "How the window looks. system follows your Windows setting.",
+    },
+    Key {
         name: "log_path",
         title: "Game log path",
         kind: Kind::Path,
@@ -111,6 +120,7 @@ pub struct Settings {
     pub clear_on_exit: bool,
     /// `None` finds Deadlock's log automatically.
     pub log_path: Option<String>,
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -124,6 +134,7 @@ impl Default for Settings {
             report_on_open: true,
             clear_on_exit: false,
             log_path: None,
+            theme: "system".to_string(),
         }
     }
 }
@@ -165,6 +176,7 @@ impl Settings {
             "report_on_open" => on_off(self.report_on_open),
             "clear_on_exit" => on_off(self.clear_on_exit),
             "log_path" => self.log_path.clone().unwrap_or_else(|| "auto".to_string()),
+            "theme" => self.theme.clone(),
             _ => String::new(),
         }
     }
@@ -195,6 +207,15 @@ impl Settings {
             }
             "report_on_open" => self.report_on_open = toggle(key, value)?,
             "clear_on_exit" => self.clear_on_exit = toggle(key, value)?,
+            "theme" => {
+                let theme = value.to_lowercase();
+                if !["system", "light", "dark"].contains(&theme.as_str()) {
+                    return Err(format!(
+                        "theme must be system, light or dark, not '{value}'"
+                    ));
+                }
+                self.theme = theme;
+            }
             "log_path" => {
                 let path = value.trim_matches('"');
                 if path.is_empty() {
@@ -277,8 +298,7 @@ pub fn kind(key: &str) -> Option<Kind> {
 
 /// Where settings are kept. `None` if Windows doesn't say, and then they last only this session.
 pub fn default_path() -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")?;
-    Some(Path::new(&base).join("dl-rs").join("settings.ini"))
+    diag::data_dir().map(|folder| folder.join("settings.ini"))
 }
 
 /// A missing file is normal and gives the defaults.
@@ -355,6 +375,7 @@ mod tests {
             ("report_every", "0", "1 to 3600"),
             ("report_on_open", "maybe", "on or off"),
             ("hold_in_game", "1", "on or off"),
+            ("theme", "blue", "system, light or dark"),
             ("clear_on_exit", "", "on or off"),
             ("backup", "two words", "none or a server"),
             ("log_path", "\"\"", "auto or a file path"),
@@ -402,6 +423,7 @@ mod tests {
         settings.set("report_on_open", "off").unwrap();
         settings.set("clear_on_exit", "on").unwrap();
         settings.set("log_path", r"D:\a b\console.log").unwrap();
+        settings.set("theme", "dark").unwrap();
         let (read, notes) = Settings::parse(&settings.to_text());
         assert_eq!(read, settings);
         assert!(notes.is_empty(), "{notes:?}");

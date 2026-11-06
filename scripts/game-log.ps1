@@ -9,19 +9,25 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function Find-Log {
-    $relative = 'steamapps\common\Deadlock\game\citadel\console.log'
-    $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
-    if (-not $steam) { $steam = 'C:\Program Files (x86)\Steam' }
-    $steam = $steam -replace '/', '\'
-    $libraries = @($steam)
-    $folders = Join-Path $steam 'steamapps\libraryfolders.vdf'
-    if (Test-Path $folders) {
-        foreach ($line in Get-Content $folders) {
-            if ($line -match '"path"\s+"([^"]+)"') { $libraries += $Matches[1] -replace '\\\\', '\' }
+    $roots = @(
+        (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath,
+        (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam' -ErrorAction SilentlyContinue).InstallPath,
+        (Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Steam')
+    ) | Where-Object { $_ } | ForEach-Object { $_ -replace '/', '\' } | Select-Object -Unique
+    $libraries = @($roots)
+    foreach ($root in $roots) {
+        $folders = Join-Path $root 'steamapps\libraryfolders.vdf'
+        if (Test-Path $folders) {
+            foreach ($line in Get-Content $folders) {
+                if ($line -match '"path"\s+"([^"]+)"') { $libraries += $Matches[1] -replace '\\\\', '\' }
+            }
         }
     }
-    foreach ($library in $libraries) {
-        $candidate = Join-Path $library $relative
+    foreach ($library in ($libraries | Select-Object -Unique)) {
+        $folder = 'Deadlock'
+        $manifest = Join-Path $library 'steamapps\appmanifest_1422450.acf'
+        if ((Test-Path $manifest) -and ((Get-Content $manifest -Raw) -match '"installdir"\s+"([^"]+)"')) { $folder = $Matches[1] }
+        $candidate = Join-Path $library "steamapps\common\$folder\game\citadel\console.log"
         if (Test-Path $candidate) { return $candidate }
     }
     throw "console.log not found under: $($libraries -join ', '). Add -condebug to Deadlock's launch options and run the game once."

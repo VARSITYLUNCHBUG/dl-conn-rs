@@ -137,7 +137,7 @@ impl Output {
                 if let Some(error) = &status.error {
                     lines.push(format!("error: {error}"));
                 }
-                lines.push(monitor::direct_label(&status.pick, &status.monitor.direct));
+                lines.push(monitor::direct_label(&status.pick, &status.monitor));
                 lines.push(monitor::route_label(&status.pick, &status.monitor));
                 lines
             }
@@ -193,6 +193,12 @@ impl Handle {
         self.send(line, true)
     }
 
+    /// Hands the session a relay list, as a fetch would.
+    #[cfg(test)]
+    pub fn inject_relays(&self, pops: Pops) {
+        let _ = self.tx.send(Message::Relays(pops));
+    }
+
     /// The known servers for completion. Available immediately, even during a slow command.
     pub fn servers(&self) -> Vec<ServerName> {
         self.servers.lock().unwrap().clone()
@@ -235,6 +241,23 @@ pub fn spawn(firewall: impl Firewall, host: impl Host) -> Handle {
         servers: session.servers.clone(),
     };
     thread::spawn(move || session.run(&rx));
+    handle
+}
+
+/// A session with no fetching and no monitor, so UI tests need no network and send no pings.
+#[cfg(test)]
+pub fn spawn_offline(firewall: impl Firewall, host: impl Host) -> Handle {
+    let (tx, rx) = channel();
+    let (wake, wake_rx) = channel();
+    let session = Session::new(firewall, host, wake);
+    let handle = Handle {
+        tx,
+        servers: session.servers.clone(),
+    };
+    thread::spawn(move || {
+        let _keep_open = wake_rx;
+        session.run(&rx);
+    });
     handle
 }
 
@@ -668,6 +691,10 @@ impl<F: Firewall, H: Host> Session<F, H> {
             None => self.default_backup(&server),
         };
         let changed = server != self.pick || backup != self.backup;
+        if server != self.pick {
+            // A figure for the last pick would be wrong until the monitor measures this one.
+            self.monitor.direct = Direct::Waiting;
+        }
         self.pick = server;
         self.backup = backup;
         let result = self.reconcile();
@@ -693,6 +720,7 @@ impl<F: Firewall, H: Host> Session<F, H> {
     }
 
     fn clear_pick(&mut self) -> Reply {
+        self.monitor.direct = Direct::NoPick;
         self.pick.clear();
         self.backup = None;
         let result = self.reconcile();
@@ -1379,6 +1407,24 @@ mod tests {
     }
 
     #[test]
+    fn changing_the_pick_drops_the_old_direct_figure() {
+        let (mut session, _, _, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        session.monitor.direct = Direct::Ms(40);
+        run(&mut session, "set pick fra").unwrap();
+        assert_eq!(
+            session.monitor.direct,
+            Direct::Ms(40),
+            "same pick, still true"
+        );
+        run(&mut session, "set pick waw").unwrap();
+        assert_eq!(session.monitor.direct, Direct::Waiting);
+        session.monitor.direct = Direct::Ms(40);
+        run(&mut session, "clear pick").unwrap();
+        assert_eq!(session.monitor.direct, Direct::NoPick);
+    }
+
+    #[test]
     fn status_carries_the_counters() {
         let (mut session, _, _, _wake) = session();
         run(&mut session, "set pick fra").unwrap();
@@ -1387,7 +1433,7 @@ mod tests {
         assert_eq!(status.monitor.direct, Direct::Ms(40));
         let lines = Output::Status(status).render();
         assert!(lines.iter().any(|line| line.starts_with("Direct: 40 ms")));
-        assert!(lines.iter().any(|line| line.starts_with("ExitLag route:")));
+        assert!(lines.iter().any(|line| line.starts_with("Game:")));
     }
 
     #[test]

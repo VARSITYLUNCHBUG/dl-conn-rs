@@ -19,16 +19,16 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $OutDir | Out-Null
+$OutDir = (Resolve-Path $OutDir).Path
+# Settings and the log stay in the output folder, away from the real ones.
+$data = Join-Path $OutDir 'data'
+New-Item -ItemType Directory -Force $data | Out-Null
+$env:DL_RS_DATA_DIR = $data
 $log = Join-Path $OutDir 'results.txt'
 Set-Content $log "started $(Get-Date), process $ExeName, $Pps pps x $Size bytes"
 function Note($text) { Add-Content $log $text }
 
-Add-Type -AssemblyName System.Drawing
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
-Add-Type -ReferencedAssemblies System.Drawing -Path (Join-Path $here 'testhelpers.cs')
-
-$CB_SELECTSTRING = 0x14D; $CB_SETCURSEL = 0x14E; $CB_SHOWDROPDOWN = 0x14F
-$WM_KEYDOWN = 0x100; $VK_OEM_3 = 0xC0
+. (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'drive.ps1')
 
 $simDir = Join-Path $OutDir 'bin'
 New-Item -ItemType Directory -Force $simDir | Out-Null
@@ -90,43 +90,23 @@ function NoteCounts($label, $counts, $relays) {
 
 function StartApp {
     $proc = Start-Process $AppExe -PassThru
-    $until = (Get-Date).AddSeconds(10); $hwnd = [IntPtr]::Zero
-    while ($hwnd -eq [IntPtr]::Zero -and (Get-Date) -lt $until) {
-        Start-Sleep -Milliseconds 100
-        $hwnd = [W]::FindWindow('dl-rs', [NullString]::Value)
-    }
+    $null = $proc.Handle
+    $hwnd = WaitForWindow $proc 10
     if ($hwnd -eq [IntPtr]::Zero) { throw 'no main window' }
-    $combo = [W]::FindWindowEx($hwnd, [IntPtr]::Zero, 'COMBOBOX', [NullString]::Value)
-    @{ Proc = $proc; Hwnd = $hwnd; Combo = $combo }
+    @{ Proc = $proc; Hwnd = $hwnd }
 }
 
-function PickItem($app, $prefix) {
-    [void][W]::SendMessage($app.Combo, $CB_SHOWDROPDOWN, [IntPtr]1, [IntPtr]::Zero)
-    if ($prefix) { [void][W]::SendMessage($app.Combo, $CB_SELECTSTRING, [IntPtr](-1), [string]$prefix) }
-    else { [void][W]::SendMessage($app.Combo, $CB_SETCURSEL, [IntPtr]::Zero, [IntPtr]::Zero) }
-    [void][W]::SendMessage($app.Combo, $CB_SHOWDROPDOWN, [IntPtr]::Zero, [IntPtr]::Zero)
+# Picks through the dropdown's search, or chooses No block with no text.
+function PickItem($app, $text) {
+    $query = if ($text) { $text } else { 'no block' }
+    SearchServers $app.Hwnd $query
+    Press $app.Hwnd $VK_RETURN
 }
 
-function WaitTitle($hwnd, $text, $seconds = 20) {
-    $until = (Get-Date).AddSeconds($seconds)
-    while ((Get-Date) -lt $until) {
-        $title = [W]::Title($hwnd)
-        if ($title.Contains($text)) { return $title }
-        Start-Sleep -Milliseconds 200
-    }
-    "TIMEOUT, title was: " + [W]::Title($hwnd)
-}
+# The log file holds what the console page shows.
+function ConsoleRows($app) { LogLines $data }
 
-# Reads the console once, then detaches so child processes get a console of their own.
-function ConsoleRows($app) {
-    if (-not [Con]::Attach([uint32]$app.Proc.Id)) { [Con]::Detach(); return @() }
-    try { [Con]::Rows() } finally { [Con]::Detach() }
-}
-
-function ConsoleType($app, $text) {
-    if (-not [Con]::Attach([uint32]$app.Proc.Id)) { [Con]::Detach(); return }
-    try { [Con]::Type($text) } finally { [Con]::Detach() }
-}
+function ConsoleType($app, $text) { RunCommand $app.Hwnd $text }
 
 # Totals the console's "blocked <app> -> <site> <ip> xN" lines by destination, for one app.
 function DropsByIp($rows) {
@@ -153,7 +133,7 @@ function NoteWire($label, $counts, $config, $pickCode) {
 }
 
 # Applies the block during a real match and measures its effect and dl-rs's own cost. Sends no test
-# traffic, opens no console so it can't take focus, and leaves dl-rs running with the block on.
+# traffic, posts its input so it can't take focus, and leaves dl-rs running with the block on.
 function ProbeScenario($config) {
     $pickRelay = $config.pops.$Pick
     Note "--- 1. the match with no block, 15 s"
@@ -163,10 +143,11 @@ function ProbeScenario($config) {
 
     Note "--- 2. block applied during the match, 60 s"
     $app = StartApp
-    [void][W]::PostMessage($app.Hwnd, 0x112, [IntPtr]0xF020, [IntPtr]::Zero)
     Note "title: $(WaitTitle $app.Hwnd 'no block')"
     PickItem $app $pickRelay.desc
     Note "title: $(WaitTitle $app.Hwnd 'blocked')"
+    # Minimized only now, because a minimized window doesn't draw or take input.
+    [void][W]::PostMessage($app.Hwnd, 0x112, [IntPtr]0xF020, [IntPtr]::Zero)
     Note "block applied at $(Get-Date -Format HH:mm:ss)"
     $proc = Get-Process -Id $app.Proc.Id
     $cpuBefore = $proc.TotalProcessorTime
@@ -199,8 +180,7 @@ function GameScenario($config) {
     Note "title: $(WaitTitle $app.Hwnd 'no block')"
     PickItem $app $pickRelay.Desc
     Note "title: $(WaitTitle $app.Hwnd 'blocked')"
-    [void][W]::PostMessage($app.Combo, $WM_KEYDOWN, [IntPtr]$VK_OEM_3, [IntPtr]::Zero)
-    Start-Sleep -Seconds 1
+    ToggleConsole $app.Hwnd
     CaptureStart 'game-block'
     Start-Sleep -Seconds 60
     NoteWire 'game' (CaptureStop 'game-block') $config $Pick
@@ -272,13 +252,12 @@ try {
     Note "--- 2. block under sustained load, with a live relay refresh mid-run"
     PickItem $app $openRelay.Desc
     Note "title: $(WaitTitle $app.Hwnd 'blocked')"
-    [void][W]::PostMessage($app.Combo, $WM_KEYDOWN, [IntPtr]$VK_OEM_3, [IntPtr]::Zero)
-    Start-Sleep -Seconds 1
+    ToggleConsole $app.Hwnd
     Note "echo, $($openRelay.Code) picked: $(LocalEcho 8)"
     CaptureStart 'block'
     $run = StartSim 30 $openRelay.Ip $probeIps $Warmup
     Start-Sleep -Seconds 15
-    ConsoleType $app "refresh relays`r"
+    ConsoleType $app 'refresh relays'
     $result = FinishSim $run
     NoteCounts 'block' (CaptureStop 'block') $all
     Note "sim: $result"

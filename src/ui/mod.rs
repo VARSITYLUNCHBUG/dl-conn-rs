@@ -1,396 +1,227 @@
-//! Native Win32 UI: a searchable dropdown, two ping counters, and the F1, F2 and F3 windows. Every
-//! action is a command sent to the session, and everything it shows comes from querying the session,
-//! so the UI holds no logic of its own.
+//! The window, built on egui. This file starts it and reports anything that stops it starting, using
+//! plain message boxes because there may be no working window to show them in.
 
-mod dropdown;
+mod app;
+mod pages;
+mod picker;
 mod rows;
-mod settings_window;
-mod text_window;
+mod theme;
 
-use crate::console;
-use crate::from_wide;
-use crate::session::{self, Firewall, Handle, Host, Output, Server, Status};
+#[cfg(test)]
+mod tests;
+
+use crate::log;
+use crate::session::{self, Firewall};
 use crate::wfp::Engine;
 use crate::wide;
-use rows::View;
-use std::ffi::c_void;
-use std::mem::{size_of, zeroed};
+use app::App;
+use eframe::egui::{self, Context, ViewportCommand};
+use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
+use eframe::wgpu;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Arc;
 use std::thread;
-use text_window::Kind;
-use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::Graphics::Gdi::*;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT};
-use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, VK_DOWN, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_NEXT, VK_OEM_3, VK_PRIOR, VK_RETURN,
-    VK_UP,
+use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, INFINITE, OpenEventW, SetEvent, WaitForSingleObject,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    ASFW_ANY, AllowSetForegroundWindow, MB_ICONERROR, MB_ICONWARNING, MessageBoxW,
+};
 use windows_sys::w;
 
-const WM_VIEW: u32 = WM_APP;
-/// The session has finished what it does on exit, so the window can close.
-const WM_EXIT: u32 = WM_APP + 1;
-const ID_COMBO: usize = 1;
-const ID_DIRECT: usize = 2;
-const ID_ROUTE: usize = 3;
-const ID_KEYS: usize = 4;
-const CLIENT_WIDTH: i32 = 480;
-const CLIENT_HEIGHT: i32 = 122;
-const MARGIN: i32 = 12;
-const COUNTER_TOP: i32 = 46;
-const COUNTER_HEIGHT: i32 = 20;
-const KEYS_TOP: i32 = 94;
-const KEYS_TEXT: &str = "F1 Help    F2 Settings    F3 Log report    ` Console";
+const APP_NAME: &str = "dl-rs";
+const ICON: &[u8] = include_bytes!("../../assets/icon-64.rgba");
+const ICON_SIZE: u32 = 64;
+const WINDOW_SIZE: [f32; 2] = [720.0, 700.0];
+const MIN_SIZE: [f32; 2] = [560.0, 480.0];
+/// Forces the Windows software renderer, for testing and for machines with a bad graphics driver.
+const RENDERER_OVERRIDE: &str = "DL_RS_RENDERER";
+const EVENT_MODIFY_STATE: u32 = 2;
+const SYNCHRONIZE: u32 = 0x0010_0000;
 
-static MAIN: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
-static FONT: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
-static SESSION: OnceLock<Handle> = OnceLock::new();
-static PENDING_VIEW: Mutex<Option<(View, Vec<Server>, Status)>> = Mutex::new(None);
-
-struct UiHost {
-    changed: Sender<()>,
+/// Shows an error when there may be no window to show it in.
+fn message(text: &str) {
+    let text = wide(text);
+    unsafe { MessageBoxW(null_mut(), text.as_ptr(), w!("dl-rs"), MB_ICONERROR) };
 }
 
-impl Host for UiHost {
-    fn toggle_console(&self) -> bool {
-        let visible = console::toggle();
-        if !visible {
-            unsafe { SetForegroundWindow(MAIN.load(Ordering::Acquire)) };
+fn warning(text: &str) {
+    let text = wide(text);
+    unsafe { MessageBoxW(null_mut(), text.as_ptr(), w!("dl-rs"), MB_ICONWARNING) };
+}
+
+/// Records a crash and says so. The block stays on, which is the safe side.
+fn install_panic_handler() {
+    std::panic::set_hook(Box::new(|info| {
+        let text = format!("dl-rs stopped because of an internal error: {info}");
+        log::emergency(&text);
+        message(&format!(
+            "{text}\n\nAny block already on stays on until you pick again or restart the PC. \
+             Details are in dl-rs.log, in the app's data folder."
+        ));
+    }));
+}
+
+/// Prefers the GPU that uses least power, so a laptop's game GPU isn't woken for a small window. The
+/// Windows software renderer is the last resort, for VMs and remote sessions with no usable GPU.
+fn adapter_rank(device: wgpu::DeviceType, force_software: bool) -> u8 {
+    match device {
+        wgpu::DeviceType::Cpu if force_software => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::DiscreteGpu => 2,
+        wgpu::DeviceType::VirtualGpu | wgpu::DeviceType::Other => 3,
+        wgpu::DeviceType::Cpu => 4,
+    }
+}
+
+fn graphics() -> WgpuConfiguration {
+    let force_software =
+        std::env::var_os(RENDERER_OVERRIDE).is_some_and(|value| value == "software");
+    let mut setup = WgpuSetupCreateNew::without_display_handle();
+    setup.instance_descriptor.backends = wgpu::Backends::DX12;
+    setup.power_preference = wgpu::PowerPreference::LowPower;
+    // A small window has little to store, so ask for small graphics memory blocks.
+    setup.device_descriptor = Arc::new(|_adapter| wgpu::DeviceDescriptor {
+        label: Some("dl-rs"),
+        required_limits: wgpu::Limits {
+            max_texture_dimension_2d: 8192,
+            ..wgpu::Limits::default()
+        },
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        ..wgpu::DeviceDescriptor::default()
+    });
+    setup.native_adapter_selector = Some(Arc::new(move |adapters, surface| {
+        let chosen = adapters
+            .iter()
+            .filter(|adapter| surface.is_none_or(|surface| adapter.is_surface_supported(surface)))
+            .min_by_key(|adapter| adapter_rank(adapter.get_info().device_type, force_software))
+            .cloned()
+            .ok_or_else(|| "DirectX 12 has no usable adapter on this PC".to_string())?;
+        let info = chosen.get_info();
+        log!("renderer: {} ({:?})", info.name, info.device_type);
+        Ok(chosen)
+    }));
+    WgpuConfiguration {
+        wgpu_setup: WgpuSetup::CreateNew(setup),
+        ..WgpuConfiguration::default()
+    }
+}
+
+/// Lets a later launch bring this one forward. A named event is used because the window class name
+/// belongs to the windowing library.
+fn listen_for_second_launch(ctx: Context) {
+    let event = unsafe { CreateEventW(null(), 0, 0, w!("Global\\dl-rs-show")) } as usize;
+    if event == 0 {
+        return;
+    }
+    thread::spawn(move || {
+        while unsafe { WaitForSingleObject(event as _, INFINITE) } == 0 {
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+            ctx.request_repaint();
         }
-        visible
-    }
+    });
+}
 
-    fn quit(&self) {
-        unsafe { PostMessageW(MAIN.load(Ordering::Acquire), WM_EXIT, 0, 0) };
+fn ask_first_launch_to_show() {
+    unsafe {
+        // This launch came from the user, so it's allowed to hand them the foreground.
+        AllowSetForegroundWindow(ASFW_ANY);
+        let event = OpenEventW(
+            EVENT_MODIFY_STATE | SYNCHRONIZE,
+            0,
+            w!("Global\\dl-rs-show"),
+        );
+        if !event.is_null() {
+            SetEvent(event);
+        }
     }
+}
 
-    fn changed(&self) {
-        let _ = self.changed.send(());
+fn window() -> eframe::NativeOptions {
+    let icon = egui::IconData {
+        rgba: ICON.to_vec(),
+        width: ICON_SIZE,
+        height: ICON_SIZE,
+    };
+    #[cfg(test)]
+    let event_loop_builder: Option<eframe::EventLoopBuilderHook> = Some(Box::new(|builder| {
+        // The test harness runs tests on a thread of its own.
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        builder.with_any_thread(true);
+    }));
+    #[cfg(not(test))]
+    let event_loop_builder = None;
+    eframe::NativeOptions {
+        event_loop_builder,
+        viewport: egui::ViewportBuilder::default()
+            .with_title("dl-rs - loading")
+            .with_inner_size(WINDOW_SIZE)
+            .with_min_inner_size(MIN_SIZE)
+            .with_icon(icon),
+        wgpu_options: graphics(),
+        ..eframe::NativeOptions::default()
+    }
+}
+
+/// Opens the window and runs until it closes.
+fn open_window(firewall: impl Firewall) {
+    let started = eframe::run_native(
+        APP_NAME,
+        window(),
+        Box::new(move |creation| {
+            let ctx = creation.egui_ctx.clone();
+            theme::install(&ctx);
+            listen_for_second_launch(ctx.clone());
+            let app = App::start(ctx, |host| session::spawn(firewall, host));
+            Ok(Box::new(app))
+        }),
+    );
+    if let Err(error) = started {
+        log!("window failed: {error}");
+        warning(&format!(
+            "dl-rs couldn't open its window: {error}\n\nIt needs DirectX 12, on Windows 10 or later. \
+             Any block already on is unchanged, and lasts until you restart the PC."
+        ));
     }
 }
 
 pub fn run() {
+    install_panic_handler();
     unsafe {
-        // Two copies would fight over the same filters, so the second just focuses the first.
-        CreateMutexW(null(), 0, w!("Local\\dl-rs"));
+        // Filters are machine-wide, so two copies anywhere on this PC would fight over them.
+        CreateMutexW(null(), 0, w!("Global\\dl-rs"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            let existing = FindWindowW(w!("dl-rs"), null());
-            if !existing.is_null() {
-                ShowWindow(existing, SW_RESTORE);
-                SetForegroundWindow(existing);
-            }
+            ask_first_launch_to_show();
             return;
         }
-        let engine = match Engine::open() {
-            Ok(engine) => engine,
-            Err(error) => {
-                let text = wide(&format!("Windows Filtering Platform: {error}"));
-                MessageBoxW(null_mut(), text.as_ptr(), w!("dl-rs"), MB_ICONERROR);
-                return;
-            }
-        };
-        serve(engine);
     }
-}
-
-/// Opens the windows and runs until the main one closes.
-unsafe fn serve(firewall: impl Firewall) {
-    unsafe {
-        create_main(GetModuleHandleW(null()));
-        let (changed, changes) = channel();
-        let session = session::spawn(firewall, UiHost { changed });
-        console::init(session.clone());
-        let _ = SESSION.set(session.clone());
-        thread::spawn(move || view_loop(&session, &changes));
-        let mut message: MSG = zeroed();
-        while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
-            if message.message == WM_KEYDOWN && key(&message) {
-                continue;
-            }
-            if settings_window::owns(GetAncestor(message.hwnd, GA_ROOT))
-                && settings_window::dialog_message(&message)
-            {
-                continue;
-            }
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-            dropdown::key_done();
+    if let Some(folder) = crate::diag::data_dir() {
+        log::to_file(folder.join("dl-rs.log"));
+    }
+    log!("dl-rs {} starting", env!("CARGO_PKG_VERSION"));
+    let engine = match Engine::open() {
+        Ok(engine) => engine,
+        Err(error) => {
+            log!("filtering platform failed: {error}");
+            message(&format!(
+                "dl-rs couldn't open the Windows Filtering Platform: {error}\n\nCheck that the Base \
+                 Filtering Engine service is running, then open dl-rs again."
+            ));
+            return;
         }
-    }
-}
-
-/// Filtered here so keys work whichever control has focus. The dropdown would otherwise treat them
-/// as type-ahead or search text. Returns whether the key was used.
-unsafe fn key(message: &MSG) -> bool {
-    let code = message.wParam as u16;
-    unsafe {
-        let top = GetAncestor(message.hwnd, GA_ROOT);
-        match code {
-            VK_OEM_3 => run_command("toggle console"),
-            VK_F1 => text_window::open(Kind::Guide),
-            VK_F2 => settings_window::open(),
-            VK_F3 => text_window::open(Kind::Report),
-            VK_ESCAPE => {
-                if text_window::owns(top) {
-                    DestroyWindow(top);
-                } else if settings_window::owns(top) {
-                    settings_window::close();
-                } else {
-                    return dropdown::escape(MAIN.load(Ordering::Acquire));
-                }
-            }
-            VK_RETURN => {
-                if message.hwnd == dropdown::edit() || message.hwnd == dropdown::control() {
-                    return dropdown::enter(MAIN.load(Ordering::Acquire));
-                }
-                return settings_window::owns(top) && settings_window::enter(message.hwnd);
-            }
-            VK_DOWN | VK_NEXT => {
-                dropdown::arrow_pressed(true);
-                return false;
-            }
-            VK_UP | VK_PRIOR => {
-                dropdown::arrow_pressed(false);
-                return false;
-            }
-            _ => return false,
-        }
-    }
-    true
-}
-
-fn session() -> Option<Handle> {
-    SESSION.get().cloned()
-}
-
-fn run_command(line: &str) {
-    if let Some(session) = SESSION.get() {
-        // The UI reacts to the "changed" signal rather than to individual replies.
-        let _ = session.run(line);
-    }
-}
-
-/// Refreshes the view whenever the session reports a change. It's a separate thread so the UI
-/// thread never waits on the session.
-fn view_loop(session: &Handle, changes: &Receiver<()>) {
-    while changes.recv().is_ok() {
-        while changes.try_recv().is_ok() {}
-        let servers = session.query("list servers").recv();
-        let status = session.query("show status").recv();
-        if let (Ok(Ok(Output::Servers(servers))), Ok(Ok(Output::Status(status)))) =
-            (servers, status)
-        {
-            let view = rows::build_view(&servers, &status);
-            *PENDING_VIEW.lock().unwrap() = Some((view, servers, status));
-            unsafe { PostMessageW(MAIN.load(Ordering::Acquire), WM_VIEW, 0, 0) };
-        }
-    }
-}
-
-fn scale(value: i32) -> i32 {
-    value * unsafe { GetDpiForSystem() } as i32 / 96
-}
-
-/// Gives a control the same system font as everything else.
-unsafe fn set_font(control: HWND) {
-    unsafe {
-        SendMessageW(
-            control,
-            WM_SETFONT,
-            FONT.load(Ordering::Acquire) as WPARAM,
-            1,
-        );
-    }
-}
-
-/// A window's text.
-unsafe fn wide_text(window: HWND) -> String {
-    unsafe {
-        let length = GetWindowTextLengthW(window);
-        let mut buffer = vec![0u16; usize::try_from(length).unwrap_or(0) + 1];
-        GetWindowTextW(window, buffer.as_mut_ptr(), buffer.len() as i32);
-        from_wide(&buffer)
-    }
-}
-
-unsafe fn label(window: HWND, module: HMODULE, id: usize, top: i32, text: &str) {
-    unsafe {
-        let handle = CreateWindowExW(
-            0,
-            w!("STATIC"),
-            wide(text).as_ptr(),
-            WS_CHILD | WS_VISIBLE,
-            scale(MARGIN),
-            scale(top),
-            scale(CLIENT_WIDTH - 2 * MARGIN),
-            scale(COUNTER_HEIGHT),
-            window,
-            id as HMENU,
-            module,
-            null(),
-        );
-        set_font(handle);
-    }
-}
-
-unsafe fn create_main(module: HMODULE) {
-    unsafe {
-        let mut class: WNDCLASSW = zeroed();
-        class.lpfnWndProc = Some(main_proc);
-        class.hInstance = module;
-        class.lpszClassName = w!("dl-rs");
-        class.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
-        class.hbrBackground = (COLOR_BTNFACE + 1) as usize as HBRUSH;
-        RegisterClassW(&class);
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut frame = RECT {
-            left: 0,
-            top: 0,
-            right: scale(CLIENT_WIDTH),
-            bottom: scale(CLIENT_HEIGHT),
-        };
-        AdjustWindowRect(&mut frame, style, 0);
-        let window = CreateWindowExW(
-            0,
-            w!("dl-rs"),
-            w!("dl-rs - loading"),
-            style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            frame.right - frame.left,
-            frame.bottom - frame.top,
-            null_mut(),
-            null_mut(),
-            module,
-            null(),
-        );
-        MAIN.store(window, Ordering::Release);
-        let mut metrics: NONCLIENTMETRICSW = zeroed();
-        metrics.cbSize = size_of::<NONCLIENTMETRICSW>() as u32;
-        SystemParametersInfoW(
-            SPI_GETNONCLIENTMETRICS,
-            metrics.cbSize,
-            (&raw mut metrics).cast(),
-            0,
-        );
-        let font = CreateFontIndirectW(&metrics.lfMessageFont);
-        FONT.store(font, Ordering::Release);
-        let mut bold = metrics.lfMessageFont;
-        bold.lfWeight = FW_BOLD as i32;
-        let bold = CreateFontIndirectW(&bold);
-        dropdown::create(
-            window,
-            module,
-            font,
-            bold,
-            scale(MARGIN),
-            scale(MARGIN),
-            scale(CLIENT_WIDTH - 2 * MARGIN),
-        );
-        label(
-            window,
-            module,
-            ID_DIRECT,
-            COUNTER_TOP,
-            "Direct: pick a server",
-        );
-        label(
-            window,
-            module,
-            ID_ROUTE,
-            COUNTER_TOP + COUNTER_HEIGHT,
-            "ExitLag route: not running",
-        );
-        label(window, module, ID_KEYS, KEYS_TOP, KEYS_TEXT);
-        ShowWindow(window, SW_SHOW);
-        SetFocus(dropdown::control());
-    }
-}
-
-unsafe extern "system" fn main_proc(
-    window: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    unsafe {
-        match message {
-            WM_MEASUREITEM if wparam == ID_COMBO => {
-                dropdown::measure(&mut *(lparam as *mut MEASUREITEMSTRUCT));
-                1
-            }
-            WM_DRAWITEM if wparam == ID_COMBO => {
-                dropdown::draw(&*(lparam as *const DRAWITEMSTRUCT));
-                1
-            }
-            WM_COMMAND if wparam & 0xFFFF == ID_COMBO => {
-                dropdown::notify(window, (wparam >> 16) as u32 & 0xFFFF);
-                0
-            }
-            WM_VIEW => {
-                apply_view(window);
-                0
-            }
-            WM_CLOSE => {
-                // Closing is a command, so a setting can act on it before the window goes.
-                if SESSION.get().is_some() {
-                    run_command("quit");
-                } else {
-                    DestroyWindow(window);
-                }
-                0
-            }
-            WM_EXIT => {
-                DestroyWindow(window);
-                0
-            }
-            WM_DESTROY => {
-                // WFP filters are left in place unless clear_on_exit removed them: they last until
-                // reboot.
-                PostQuitMessage(0);
-                0
-            }
-            _ => DefWindowProcW(window, message, wparam, lparam),
-        }
-    }
-}
-
-/// Updates a control's text only when it changed, so counters don't flicker.
-unsafe fn set_text(control: HWND, text: &str) {
-    unsafe {
-        if wide_text(control) != text {
-            SetWindowTextW(control, wide(text).as_ptr());
-        }
-    }
-}
-
-unsafe fn apply_view(window: HWND) {
-    unsafe {
-        // The lock isn't held across SendMessage, which can re-enter main_proc.
-        let pending = PENDING_VIEW.lock().unwrap().take();
-        if let Some((view, servers, status)) = pending {
-            dropdown::update(servers, status);
-            set_text(window, &view.title);
-            set_text(GetDlgItem(window, ID_DIRECT as i32), &view.direct);
-            set_text(GetDlgItem(window, ID_ROUTE as i32), &view.route);
-        }
-        dropdown::refresh();
-    }
+    };
+    open_window(engine);
 }
 
 #[cfg(test)]
-mod tests {
+mod adapter_tests {
     use super::*;
     use crate::sdr::Blocks;
+    use std::sync::Mutex;
 
-    /// Lets a script drive the real windows with no admin rights and no real filters.
+    /// Lets a script open the real window with no admin rights and no real filters.
     #[derive(Default)]
     struct FakeFirewall(Mutex<Option<String>>);
 
@@ -412,8 +243,29 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens real windows; run by scripts/ui-test.ps1"]
-    fn windows_with_a_fake_firewall() {
-        unsafe { serve(FakeFirewall::default()) };
+    #[ignore = "opens the real window on the main thread; run with --test-threads=1"]
+    fn window_with_a_fake_firewall() {
+        if let Some(folder) = crate::diag::data_dir() {
+            log::to_file(folder.join("dl-rs.log"));
+        }
+        open_window(FakeFirewall::default());
+    }
+
+    #[test]
+    fn the_window_icon_matches_its_size() {
+        assert_eq!(ICON.len() as u32, ICON_SIZE * ICON_SIZE * 4);
+    }
+
+    #[test]
+    fn prefers_the_low_power_gpu_and_keeps_software_as_the_last_resort() {
+        let rank = |device| adapter_rank(device, false);
+        assert!(rank(wgpu::DeviceType::IntegratedGpu) < rank(wgpu::DeviceType::DiscreteGpu));
+        assert!(rank(wgpu::DeviceType::DiscreteGpu) < rank(wgpu::DeviceType::Cpu));
+        assert!(rank(wgpu::DeviceType::VirtualGpu) < rank(wgpu::DeviceType::Cpu));
+    }
+
+    #[test]
+    fn software_can_be_forced() {
+        assert_eq!(adapter_rank(wgpu::DeviceType::Cpu, true), 0);
     }
 }

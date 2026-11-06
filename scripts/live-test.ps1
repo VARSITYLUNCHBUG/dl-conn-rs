@@ -1,6 +1,6 @@
-# Elevated end-to-end test: real WFP filters, real relays, and the real app. The dropdown is driven
-# through window messages, and the console through real keystrokes with its screen read back.
-# Run from an admin shell after building:
+# Elevated end-to-end test: real WFP filters, real relays and the real app. It drives the window through
+# posted keys and UI Automation, reads the window title and the app's log file, and uses the real mouse
+# near the end. It switches picks, so don't run it during a match. Run from an admin shell after building:
 #   cargo test --no-run; cargo build --release
 #   powershell -ExecutionPolicy Bypass -File scripts\live-test.ps1 -TestExe <target\debug\deps\dl_rs-*.exe> -AppExe <target\release\dl-rs.exe> -OutDir <dir>
 param(
@@ -10,9 +10,12 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $OutDir | Out-Null
-# Settings this test changes stay in its output folder, away from the real ones.
-$env:LOCALAPPDATA = Join-Path (Resolve-Path $OutDir).Path 'appdata'
-New-Item -ItemType Directory -Force $env:LOCALAPPDATA | Out-Null
+$OutDir = (Resolve-Path $OutDir).Path
+# Settings and the log stay in the output folder, away from the real ones.
+$data = Join-Path $OutDir 'data'
+Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $data | Out-Null
+$env:DL_RS_DATA_DIR = $data
 $log = Join-Path $OutDir 'results.txt'
 Set-Content $log "started $(Get-Date)"
 function Note($text) { Add-Content $log $text }
@@ -21,14 +24,7 @@ function Check($name, [bool]$ok) {
     if (-not $ok) { $script:failures++ }
     Note ("{0}  {1}" -f $(if ($ok) { 'PASS' } else { 'FAIL' }), $name)
 }
-
-Add-Type -AssemblyName System.Drawing
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
-Add-Type -ReferencedAssemblies System.Drawing -Path (Join-Path $here 'testhelpers.cs')
-
-$CB_GETCOUNT = 0x146; $CB_SELECTSTRING = 0x14D; $CB_SETCURSEL = 0x14E; $CB_SHOWDROPDOWN = 0x14F
-$WM_KEYDOWN = 0x100; $VK_OEM_3 = 0xC0; $SC_CLOSE = 0xF060; $ESC = [string][char]27
-$script:attached = $false
+. (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'drive.ps1')
 
 function RunTest($name) {
     $out = Join-Path $OutDir (($name -replace '::', '-') + '.txt')
@@ -43,48 +39,25 @@ function RunTest($name) {
 
 function Ping1($ip) { (& ping.exe -n 1 -w 1000 $ip | Out-String) -match 'TTL=' }
 
-# An unconnected UDP send reports success even when dropped; the drop shows up in the console.
+# An unconnected UDP send reports success even when dropped; the drop shows up in the log.
 function UdpSend($ip) {
     $udp = New-Object Net.Sockets.UdpClient
     try { [void]$udp.Send([byte[]](1, 2, 3), 3, $ip, 27015) } finally { $udp.Close() }
 }
 
-function WaitTitle($hwnd, $pattern, $seconds = 20) {
-    $until = (Get-Date).AddSeconds($seconds)
-    while ((Get-Date) -lt $until) {
-        $title = [W]::Title($hwnd)
-        if ($title -match $pattern) { return $title }
-        Start-Sleep -Milliseconds 200
-    }
-    return "TIMEOUT, title was: " + [W]::Title($hwnd)
-}
-
 function StartApp {
     $proc = Start-Process $AppExe -PassThru
-    $until = (Get-Date).AddSeconds(10); $hwnd = [IntPtr]::Zero
-    while ($hwnd -eq [IntPtr]::Zero -and (Get-Date) -lt $until) {
-        Start-Sleep -Milliseconds 100
-        $hwnd = [W]::FindWindow('dl-rs', [NullString]::Value)
-    }
-    $combo = [W]::FindWindowEx($hwnd, [IntPtr]::Zero, 'COMBOBOX', [NullString]::Value)
-    return @{ Proc = $proc; Hwnd = $hwnd; Combo = $combo }
+    $null = $proc.Handle
+    @{ Proc = $proc; Hwnd = (WaitForWindow $proc) }
 }
 
-# Picks through the same path as a user: open the list, change selection, close it.
-function PickItem($app, $prefix) {
-    [void][W]::SendMessage($app.Combo, $CB_SHOWDROPDOWN, [IntPtr]1, [IntPtr]::Zero)
-    if ($prefix) { [void][W]::SendMessage($app.Combo, $CB_SELECTSTRING, [IntPtr](-1), [string]$prefix) }
-    else { [void][W]::SendMessage($app.Combo, $CB_SETCURSEL, [IntPtr]::Zero, [IntPtr]::Zero) }
-    [void][W]::SendMessage($app.Combo, $CB_SHOWDROPDOWN, [IntPtr]::Zero, [IntPtr]::Zero)
+function PickServer($app, $text, $pattern) {
+    SearchServers $app.Hwnd $text
+    Press $app.Hwnd $VK_RETURN
+    WaitTitle $app.Hwnd $pattern
 }
 
-function Backtick($app) { [void][W]::PostMessage($app.Combo, $WM_KEYDOWN, [IntPtr]$VK_OEM_3, [IntPtr]::Zero) }
-
-# Types into the console, then gives the app a moment to react.
-function Keys($text, $settleMs = 400) { [Con]::Type($text); Start-Sleep -Milliseconds $settleMs }
-function Screen { [Con]::Rows() -join "`n" }
-function PromptLine { [Con]::Rows() | Select-Object -Last 1 }
-function CountOf($pattern) { @([Con]::Rows() | Where-Object { $_ -match $pattern }).Count }
+function LogHas($pattern) { (LogCount $data $pattern) -gt 0 }
 
 try {
     Note "--- environment"
@@ -98,7 +71,7 @@ try {
     RunTest 'live_tests::survives_exit_part1'
     RunTest 'live_tests::survives_exit_part2'
 
-    Note "--- dropdown"
+    Note "--- starting up"
     # Use relays that answer right now, so another tool's rules can't confuse the result.
     $config = Invoke-RestMethod 'https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid=730'
     $live = @($config.pops.PSObject.Properties | Where-Object { $_.Value.relays } | Where-Object { Ping1 $_.Value.relays[0].ipv4 } | Select-Object -First 2)
@@ -107,125 +80,150 @@ try {
     $shutCode = $live[1].Name; $shutDesc = $live[1].Value.desc; $shut = $live[1].Value.relays[0].ipv4
     Note "pick $openCode $open, expect blocked $shutCode $shut"
 
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     $app = StartApp
+    Note ("window after {0:N2} s" -f $clock.Elapsed.TotalSeconds)
     Check 'main window opens' ($app.Hwnd -ne [IntPtr]::Zero)
     if ($app.Hwnd -eq [IntPtr]::Zero) { throw 'no main window' }
     Note ('title: ' + (WaitTitle $app.Hwnd 'no block'))
-    $count = [int][W]::SendMessage($app.Combo, $CB_GETCOUNT, [IntPtr]::Zero, [IntPtr]::Zero)
-    Check "dropdown lists all relay sites ($count items)" ($count -gt 30)
-    [void][W]::SendMessage($app.Combo, $CB_SHOWDROPDOWN, [IntPtr]1, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 300
-    [W]::Shot([W]::FindWindow('ComboLBox', [NullString]::Value), (Join-Path $OutDir 'dropdown.png'))
-    [void][W]::SendMessage($app.Combo, $CB_SHOWDROPDOWN, [IntPtr]::Zero, [IntPtr]::Zero)
+    Note ("relays after {0:N2} s" -f $clock.Elapsed.TotalSeconds)
+    Check 'it logs which renderer it uses' (LogHas 'renderer: ')
+    [W]::Shot($app.Hwnd, (Join-Path $OutDir 'main.png'))
+    Start-Sleep -Seconds 3
+    $app.Proc.Refresh()
+    $before = $app.Proc.TotalProcessorTime
+    Start-Sleep -Seconds 20
+    $app.Proc.Refresh()
+    $used = ($app.Proc.TotalProcessorTime - $before).TotalSeconds
+    Note ("idle: {0:N2} s of CPU in 20 s, working set {1:N0} MB, private {2:N0} MB, exe {3:N1} MB" -f $used, ($app.Proc.WorkingSet64 / 1MB), ($app.Proc.PrivateMemorySize64 / 1MB), ((Get-Item $AppExe).Length / 1MB))
+    Check 'it uses almost no CPU while idle' ($used -lt 1.0)
 
-    PickItem $app $openDesc
-    $title = WaitTitle $app.Hwnd '\d+ blocked'
+    Note "--- a second launch"
+    $second = Start-Process $AppExe -PassThru
+    $null = $second.Handle
+    Check 'a second copy exits' ($second.WaitForExit(10000))
+    Check 'and the first keeps running' (-not $app.Proc.HasExited)
+
+    Note "--- dropdown"
+    SearchServers $app.Hwnd 'a'
+    [W]::Shot($app.Hwnd, (Join-Path $OutDir 'dropdown.png'))
+    Check 'typing opens the list with sections' ((UiHas $app.Hwnd 'Africa') -and (UiHas $app.Hwnd 'Europe'))
+    Press $app.Hwnd $VK_ESCAPE
+    Check 'Esc closes it' (-not (UiHas $app.Hwnd 'Africa' 1))
+    Check 'Esc picks nothing' ([W]::Title($app.Hwnd) -match 'no block')
+
+    $title = PickServer $app $openDesc '\d+ blocked'
     Note "title: $title"
-    Check 'pick shows in title' ($title.Contains($openDesc) -and $title -match '\d+ blocked')
+    Check 'typing and Enter pick a server' ($title.Contains($openDesc) -and $title -match '\d+ blocked')
     Check 'picked relay stays reachable' (Ping1 $open)
     Push-Location $OutDir
     & netsh wfp show state file=state-active.xml | Out-Null
     Pop-Location
     Check 'other relay ping blocked' (-not (Ping1 $shut))
-    [W]::Shot($app.Hwnd, (Join-Path $OutDir 'main.png'))
+    Start-Sleep -Seconds 7
+    $direct = @(UiNames $app.Hwnd | Where-Object { $_ -like 'Direct:*' })[0]
+    Note "direct: $direct"
+    Note ('game: ' + @(UiNames $app.Hwnd | Where-Object { $_ -like 'Game:*' -or $_ -like 'ExitLag route:*' })[0])
+    Check 'the direct counter reports on the pick' ($direct -match [regex]::Escape($openCode))
+    [W]::Shot($app.Hwnd, (Join-Path $OutDir 'picked.png'))
 
-    Note "--- console: the logger"
-    Backtick $app
-    Start-Sleep -Milliseconds 800
-    $script:attached = [Con]::Attach([uint32]$app.Proc.Id)
-    Check 'backtick opens a real console' $script:attached
-    $console = [Con]::GetConsoleWindow()
-    Check 'console window is visible' ([W]::IsWindowVisible($console))
-    Check 'console X button is removed' ([W]::GetMenuState([W]::GetSystemMenu($console, $false), $SC_CLOSE, 0) -eq -1)
-    for ($i = 0; $i -lt 20; $i++) { UdpSend $shut; Start-Sleep -Seconds 1 }
-    $text = Screen
-    Set-Content (Join-Path $OutDir 'console-log.txt') $text
-    Check 'history replayed from before it opened' ($text -match 'start: active')
-    Check 'dropdown choice was logged as a command' ($text -match "> set pick $openCode")
-    $expected = if (Get-Process ExitLag -ErrorAction SilentlyContinue) { 'processes: .*ExitLag' } else { 'processes: \S' }
-    Check 'report shows processes' ($text -match $expected)
-    Check 'report shows picking' ($text -match "picking: $openCode")
-    Check 'report shows routes' ($text -match 'via .* gw ')
-    Check 'report shows UDP drops' ($text -match "blocked .* -> $shutCode")
-    Check 'prompt is the last line' ((PromptLine) -eq 'dl-rs>')
-    [W]::Shot($console, (Join-Path $OutDir 'console.png'))
+    Note "--- console"
+    ToggleConsole $app.Hwnd
+    Check 'backtick opens the console' ($null -ne (UiFindEdit $app.Hwnd 'dl-rs>'))
+    for ($i = 0; $i -lt 8; $i++) { UdpSend $shut; Start-Sleep -Seconds 1 }
+    Check 'the log has history from before it opened' (LogHas 'start: active')
+    Check 'a dropdown choice is logged as a command' (LogHas "> set pick $openCode")
+    Check 'report shows processes' (LogHas 'processes: \S')
+    Check 'report shows picking' (LogHas "picking: $openCode")
+    Check 'report shows routes' (LogHas 'via .* gw ')
+    Check 'report shows UDP drops' (LogHas "blocked .* -> $shutCode")
+    [W]::Shot($app.Hwnd, (Join-Path $OutDir 'console.png'))
 
     Note "--- console: typing"
-    Keys "stop report`r"
-    Check 'typed command runs and echoes' ((Screen) -match '> stop report')
-    Keys 'list se'; Keys "`t"
-    Check 'tab completes a word' ((PromptLine) -eq 'dl-rs> list servers')
-    Keys $ESC
-    Check 'esc clears the line' ((PromptLine) -eq 'dl-rs>')
-    Keys 's'; Keys "`t"; Keys "`t"
-    Check 'second tab lists options with notes' ((Screen) -match 'show\s+status, routes')
-    Check 'listing leaves the line intact' ((PromptLine) -eq 'dl-rs> s')
-    Keys $ESC
-    Keys "set pick $($openCode.Substring(0, 2))"; Keys "`t"
-    Check 'tab completes a server code' ((PromptLine) -match "^dl-rs> set pick $($openCode.Substring(0, 2))")
-    Keys $ESC
-    Keys 'set pick ?'
-    Check 'question mark explains the partial line' ((Screen) -match '<server>\s+A code from')
-    Check 'question mark leaves the line intact' ((PromptLine) -eq 'dl-rs> set pick')
-    Keys $ESC
-    Keys "help set pick`r"
-    Check 'help explains one command' ((Screen) -match 'Block every relay except')
-    Keys "help`r"
-    Check 'help lists all commands' ((Screen) -match 'refresh relays' -and (Screen) -match 'toggle console')
-    Keys "set pick wibble`r"
-    Check 'bad server gives a useful error' ((Screen) -match "unknown server 'wibble'")
-    Keys "lst servers`r"
-    Check 'typo gets a suggestion' ((Screen) -match "Did you mean 'list servers'")
-    Keys "list servers --filter $openCode`r"
-    Check 'list servers filters' ((Screen) -match "$openCode\s+\d+ relays")
-    Keys "show status`r"
-    Check 'show status reports the pick' ((Screen) -match "pick: $openCode ")
-    $errors = CountOf 'error: '
-    Keys "show processes`r"; Keys "show routes`r"; Keys "ping relays`r" 1500; Keys "list relays $openCode`r"
-    Check 'diagnostic commands run without errors' ((CountOf 'error: ') -eq $errors)
-    Check 'show routes prints a route' ((Screen) -match 'via .* gw ')
+    RunCommand $app.Hwnd 'stop report'
+    Check 'a typed command runs and echoes' (LogHas '> stop report')
+    SetText $app.Hwnd 'dl-rs>' 'list se'
+    Press $app.Hwnd $VK_TAB 300
+    Check 'tab completes a word' ((PromptText $app.Hwnd) -eq 'list servers ')
+    Press $app.Hwnd $VK_ESCAPE 300
+    Check 'esc clears the line' ((PromptText $app.Hwnd) -eq '')
+    Check 'and stays on the console' ($null -ne (UiFindEdit $app.Hwnd 'dl-rs>'))
+    SetText $app.Hwnd 'dl-rs>' 's'
+    Press $app.Hwnd $VK_TAB 200
+    Press $app.Hwnd $VK_TAB 300
+    Check 'second tab lists options with notes' (LogHas 'show\s+status')
+    Check 'listing leaves the line intact' ((PromptText $app.Hwnd) -eq 's')
+    Press $app.Hwnd $VK_ESCAPE 300
+    RunCommand $app.Hwnd 'help set pick'
+    Check 'help explains one command' (LogHas 'Block every relay except')
+    RunCommand $app.Hwnd 'set pick wibble'
+    Check 'bad server gives a useful error' (LogHas "unknown server 'wibble'")
+    RunCommand $app.Hwnd 'lst servers'
+    Check 'typo gets a suggestion' (LogHas "Did you mean 'list servers'")
+    RunCommand $app.Hwnd "list servers --filter $openCode"
+    Check 'list servers filters' (LogHas "$openCode\s+\d+ relays")
+    RunCommand $app.Hwnd 'show status'
+    Check 'show status reports the pick' (LogHas "pick: $openCode ")
+    $errors = LogCount $data 'error: '
+    RunCommand $app.Hwnd 'show processes'
+    RunCommand $app.Hwnd 'show routes'
+    RunCommand $app.Hwnd 'ping relays' 1500
+    RunCommand $app.Hwnd "list relays $openCode"
+    Check 'diagnostic commands run without errors' ((LogCount $data 'error: ') -eq $errors)
 
-    Note "--- console: one state behind both front-ends"
-    Keys "set pick $shutCode`r" 1500
+    Note "--- one state behind every front-end"
+    RunCommand $app.Hwnd "set pick $shutCode" 1500
     $title = WaitTitle $app.Hwnd ([regex]::Escape($shutDesc))
     Note "title: $title"
-    Check 'typed pick updates the title' ($title.Contains($shutDesc))
-    Check 'typed pick updates the dropdown' ([W]::Selected($app.Combo).Contains($shutCode))
-    Check 'typed pick moves the block' ((Ping1 $shut) -and -not (Ping1 $open))
-    $before = CountOf '> set pick'
-    [void][W]::SendMessage($app.Combo, $CB_SHOWDROPDOWN, [IntPtr]1, [IntPtr]::Zero)
-    [void][W]::SendMessage($app.Combo, $CB_SHOWDROPDOWN, [IntPtr]::Zero, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 500
-    Check 'closing the dropdown unchanged issues nothing' ((CountOf '> set pick') -eq $before)
-    PickItem $app $openDesc
-    $title = WaitTitle $app.Hwnd ([regex]::Escape($openDesc))
+    Check 'a typed pick updates the title' ($title.Contains($shutDesc))
+    Check 'a typed pick moves the block' ((Ping1 $shut) -and -not (Ping1 $open))
+    $before = LogCount $data '> set pick'
+    SearchServers $app.Hwnd $openCode
+    Press $app.Hwnd $VK_ESCAPE 500
+    Check 'cancelling the dropdown issues nothing' ((LogCount $data '> set pick') -eq $before)
+    $title = PickServer $app $openDesc ([regex]::Escape($openDesc))
     Start-Sleep -Milliseconds 400
-    Check 'one dropdown choice logs exactly one command' ((CountOf '> set pick') -eq ($before + 1))
+    Check 'one dropdown choice logs exactly one command' ((LogCount $data '> set pick') -eq ($before + 1))
 
     Note "--- console: logging while typing"
-    Keys "start report --every 1`r"
-    Keys 'list se' 200
-    $before = CountOf 'processes:'
+    RunCommand $app.Hwnd 'start report --every 1'
+    SetText $app.Hwnd 'dl-rs>' 'list se'
+    $before = LogCount $data 'processes:'
     Start-Sleep -Seconds 3
-    Check 'log keeps scrolling while typing' ((CountOf 'processes:') -gt $before)
-    Check 'half-typed command survives log output' ((PromptLine) -eq 'dl-rs> list se')
-    Keys "`t"
-    Check 'and still completes afterwards' ((PromptLine) -eq 'dl-rs> list servers')
-    Keys $ESC
-    Keys "stop report`r"
-    Keys "clear screen`r" 800
-    Check 'clear screen clears' (-not ((Screen) -match 'start: active'))
-    Check 'prompt remains after clearing' ((PromptLine) -eq 'dl-rs>')
+    Check 'log keeps going while typing' ((LogCount $data 'processes:') -gt $before)
+    Check 'a half-typed command survives log output' ((PromptText $app.Hwnd) -eq 'list se')
+    Press $app.Hwnd $VK_ESCAPE 300
+    RunCommand $app.Hwnd 'stop report'
+    RunCommand $app.Hwnd 'clear screen'
 
-    Note "--- console: show, hide, quit"
-    Keys '`' 800
-    Check 'backtick in the console hides it' (-not [W]::IsWindowVisible($console))
-    Backtick $app
+    Note "--- pages"
+    ToggleConsole $app.Hwnd
+    Check 'backtick closes the console' ($null -eq (UiFindEdit $app.Hwnd 'dl-rs>' 1))
+    foreach ($page in @(@($VK_F1, 'CUSTOM GAME', 'f1'), @($VK_F2, 'Hold filter updates in game', 'f2'), @($VK_F3, 'FINDINGS|game log', 'f3'))) {
+        Press $app.Hwnd $page[0] 1000
+        Check "$($page[2]) opens its page" (@(UiNames $app.Hwnd | Where-Object { $_ -match $page[1] }).Count -gt 0)
+        [W]::Shot($app.Hwnd, (Join-Path $OutDir "$($page[2]).png"))
+    }
+    Press $app.Hwnd $VK_ESCAPE 500
+    ToggleConsole $app.Hwnd
+    RunCommand $app.Hwnd 'set config theme dark' 600
+    [W]::Shot($app.Hwnd, (Join-Path $OutDir 'theme-dark.png'))
+    RunCommand $app.Hwnd 'set config theme light' 600
+    [W]::Shot($app.Hwnd, (Join-Path $OutDir 'theme-light.png'))
+    RunCommand $app.Hwnd 'clear config theme' 300
+
+    Note "--- minimized"
+    [void][W]::PostMessage($app.Hwnd, 0x112, [IntPtr]0xF020, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 800
-    Check 'backtick in the UI shows it again' ([W]::IsWindowVisible($console))
-    Keys "quit`r" 300
-    Check 'quit closes the app' ($app.Proc.WaitForExit(5000))
-    [Con]::Detach(); $script:attached = $false
+    Check 'it minimizes' ([W]::IsIconic($app.Hwnd))
+    Check 'and the block holds' (-not (Ping1 $shut))
+    [void][W]::PostMessage($app.Hwnd, 0x112, [IntPtr]0xF120, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 800
+    Check 'and it comes back' (-not [W]::IsIconic($app.Hwnd))
+
+    Note "--- quit"
+    RunCommand $app.Hwnd 'quit' 300
+    Check 'quit closes the app' ($app.Proc.WaitForExit(8000))
     Check 'block outlives the app' (-not (Ping1 $shut))
 
     Note "--- reopen"
@@ -233,107 +231,41 @@ try {
     $title = WaitTitle $app.Hwnd '\d+ blocked'
     Note "reopened title: $title"
     Check 'reopened app recovers the pick from WFP' ($title.Contains($openDesc))
-    PickItem $app $null
-    $title = WaitTitle $app.Hwnd 'no block'
+    $title = PickServer $app 'no block' 'no block'
     Note "title: $title"
     Check 'No block option clears' ($title -match 'no block')
     Check 'relay reachable again' (Ping1 $shut)
 
-    Note "--- search, counters and windows on the real app"
-    $edit = [W]::FindWindowEx($app.Combo, [IntPtr]::Zero, 'Edit', [NullString]::Value)
-    foreach ($c in $openDesc.ToCharArray()) {
-        [void][W]::PostMessage($edit, 0x102, [IntPtr][int]$c, [IntPtr]::Zero)
-        Start-Sleep -Milliseconds 30
-    }
-    Start-Sleep -Milliseconds 300
-    [W]::Shot([W]::FindWindow('ComboLBox', [NullString]::Value), (Join-Path $OutDir 'dropdown-search.png'))
-    [void][W]::PostMessage($edit, $WM_KEYDOWN, [IntPtr]0x0D, [IntPtr]::Zero)
-    $title = WaitTitle $app.Hwnd '\d+ blocked'
-    Note "title: $title"
-    Check 'typing and Enter pick a server' ($title.Contains($openDesc))
-    Check 'a searched pick really blocks' (-not (Ping1 $shut))
-    Check 'and keeps the pick open' (Ping1 $open)
-    Start-Sleep -Seconds 7
-    $direct = [W]::Text([W]::GetDlgItem($app.Hwnd, 2))
-    Note "direct: $direct"
-    Note ('route: ' + [W]::Text([W]::GetDlgItem($app.Hwnd, 3)))
-    Check 'the direct counter reports on the pick' ($direct.Contains($openCode))
-    [W]::Shot($app.Hwnd, (Join-Path $OutDir 'main-counters.png'))
-    foreach ($key in @(@(0x70, 'dl-rs-text', 'f1'), @(0x71, 'dl-rs-settings', 'f2'), @(0x72, 'dl-rs-text', 'f3'))) {
-        [void][W]::PostMessage($app.Combo, $WM_KEYDOWN, [IntPtr]$key[0], [IntPtr]::Zero)
-        Start-Sleep -Milliseconds 1500
-        $window = [W]::FindWindow($key[1], [NullString]::Value)
-        Check "$($key[2]) opens its window" ($window -ne [IntPtr]::Zero)
-        [W]::Shot($window, (Join-Path $OutDir "$($key[2]).png"))
-        [void][W]::PostMessage($window, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
-        Start-Sleep -Milliseconds 300
-    }
-    PickItem $app $null
-    $title = WaitTitle $app.Hwnd 'no block'
-    Check 'and No block clears it again' ($title -match 'no block')
-
     Note "--- real mouse"
     [void][W]::SetForegroundWindow($app.Hwnd)
     Start-Sleep -Milliseconds 400
-    function OpenWithMouse {
-        $box = [W]::Rect($app.Combo)
-        [W]::Click($box[2] - 8, [int](($box[1] + $box[3]) / 2))
-        Start-Sleep -Milliseconds 400
-    }
-    # Where a row is on screen, allowing for how far the list has scrolled.
-    function RowPoint($index) {
-        $list = [W]::Rect([W]::FindWindow('ComboLBox', [NullString]::Value))
-        $top = [int][W]::SendMessage($app.Combo, 0x15B, [IntPtr]::Zero, [IntPtr]::Zero)
-        $height = [int][W]::SendMessage($app.Combo, 0x154, [IntPtr]::Zero, [IntPtr]::Zero)
-        return @(($list[0] + 60), ($list[1] + 1 + ($index - $top) * $height + [int]($height / 2)))
-    }
-    $labels = 0..([int][W]::SendMessage($app.Combo, $CB_GETCOUNT, [IntPtr]::Zero, [IntPtr]::Zero) - 1) | ForEach-Object { [W]::Item($app.Combo, $_) }
-    $africa = [array]::IndexOf($labels, 'Africa')
-
-    OpenWithMouse
-    $point = RowPoint $africa
-    [W]::Click($point[0], $point[1])
-    Start-Sleep -Milliseconds 600
-    Check 'clicking a header picks nothing' ([W]::Title($app.Hwnd) -match 'no block')
-    Check 'and leaves the selection alone' ([W]::Selected($app.Combo) -like 'No block*')
-    if ([int][W]::SendMessage($app.Combo, 0x157, [IntPtr]::Zero, [IntPtr]::Zero) -ne 0) {
-        [void][W]::SendMessage($app.Combo, $CB_SHOWDROPDOWN, [IntPtr]::Zero, [IntPtr]::Zero)
-    }
-
-    OpenWithMouse
-    [W]::Shot([W]::FindWindow('ComboLBox', [NullString]::Value), (Join-Path $OutDir 'dropdown-mouse.png'))
-    $point = RowPoint ($africa + 1)
-    [W]::Click($point[0], $point[1])
-    $title = WaitTitle $app.Hwnd 'Johannesburg'
-    Note "title: $title"
-    Check 'clicking a server picks it' ($title -match 'Johannesburg')
-
-    OpenWithMouse
-    $point = RowPoint ($africa + 3)
-    [W]::Move($point[0], $point[1])
+    UiClick $app.Hwnd 'Open the server list'
+    [W]::Shot($app.Hwnd, (Join-Path $OutDir 'dropdown-mouse.png'))
+    UiClick $app.Hwnd 'Africa'
     Start-Sleep -Milliseconds 300
-    # The title bar, because the open list covers everything below the dropdown.
+    Check 'clicking a header picks nothing' ([W]::Title($app.Hwnd) -match 'no block')
+    $site = @($config.pops.PSObject.Properties | Where-Object { $_.Name -eq 'jnb' })[0].Value.desc
+    UiClick $app.Hwnd "$site - jnb"
+    $title = WaitTitle $app.Hwnd ([regex]::Escape($site))
+    Note "title: $title"
+    Check 'clicking a server picks it' ($title.Contains($site))
+    UiClick $app.Hwnd 'Open the server list'
+    $hover = UiFind $app.Hwnd "$site - jnb"
+    Check 'the list is open again' ($null -ne $hover)
+    # Below the list, which always leaves a strip free at the bottom of the window.
     $frame = [W]::Rect($app.Hwnd)
-    [W]::Click([int](($frame[0] + $frame[2]) / 2), $frame[1] + 10)
-    Start-Sleep -Milliseconds 600
-    Check 'hovering then clicking away changes nothing' ([W]::Title($app.Hwnd) -match 'Johannesburg')
-    Check 'and the box still shows the pick' ([W]::Selected($app.Combo).Contains('jnb'))
+    [W]::Click($frame[0] + 40, $frame[3] - 18)
+    Start-Sleep -Milliseconds 500
+    Check 'clicking away closes the list' ($null -eq (UiFind $app.Hwnd "$site - jnb" 1))
+    Check 'and changes nothing' ([W]::Title($app.Hwnd).Contains($site))
 
     Note "--- clear_on_exit"
-    [void][W]::PostMessage($app.Combo, $WM_KEYDOWN, [IntPtr]0x71, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 1500
-    $form = [W]::FindWindow('dl-rs-settings', [NullString]::Value)
-    $exit = [W]::GetDlgItem($form, 106)
-    Check 'the setting is on the form' ($exit -ne [IntPtr]::Zero)
-    [void][W]::SendMessage($exit, $CB_SETCURSEL, [IntPtr]::Zero, [IntPtr]::Zero)
-    [void][W]::SendMessage($form, 0x111, [IntPtr](106 -bor (1 -shl 16)), $exit)
-    Start-Sleep -Milliseconds 800
-    Check 'it saves' ((Get-Content (Join-Path $env:LOCALAPPDATA 'dl-rs\settings.ini') -Raw) -match 'clear_on_exit=on')
-    [void][W]::PostMessage($form, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
-    Start-Sleep -Milliseconds 300
+    ToggleConsole $app.Hwnd
+    RunCommand $app.Hwnd 'set config clear_on_exit on' 600
+    Check 'it saves' ((Get-Content (Join-Path $data 'settings.ini') -Raw) -match 'clear_on_exit=on')
     Check 'the block is on before closing' (-not (Ping1 $shut))
     [void][W]::PostMessage($app.Hwnd, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
-    Check 'the X button closes the app' ($app.Proc.WaitForExit(5000))
+    Check 'the X button closes the app' ($app.Proc.WaitForExit(8000))
     Check 'clear_on_exit removed the block' (Ping1 $shut)
     $app = StartApp
     $title = WaitTitle $app.Hwnd 'no block'
@@ -345,7 +277,6 @@ catch {
     Note "FAIL  script error: $_ at line $($_.InvocationInfo.ScriptLineNumber)"
 }
 finally {
-    if ($script:attached) { [Con]::Detach() }
     Get-Process dl-rs -ErrorAction SilentlyContinue | Stop-Process -Force
     RunTest 'live_tests::clear_any_block'
     Push-Location $OutDir

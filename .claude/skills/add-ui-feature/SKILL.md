@@ -1,38 +1,35 @@
 ---
 name: add-ui-feature
-description: Add or change a dl-rs window, dialog, control or hotkey (dropdown, counters, F1/F2/F3 windows) as a thin Win32 wrapper over commands. Use for any dl-rs UI work.
+description: Add or change a dl-rs page, control or hotkey (dropdown, counters, F1/F2/F3 pages, console) as a thin egui wrapper over commands. Use for any dl-rs UI work.
 ---
 
 # Add a dl-rs UI feature
 
-The UI holds no logic. It sends command lines and displays what comes back. `docs/roadmap.md` has
-design notes for the planned windows, so check it first.
+The UI holds no logic. It sends command lines and displays what comes back.
 
 ## Pattern
 
-1. **Make the behaviour a command first** with `/add-command`. A window that can't be replaced by
-   typing into the console is a design error.
-2. **Acting:** call `session.run("verb noun ...")`. It's echoed to the log, so the console shows
-   what the UI did.
+1. **Make the behaviour a command first** with `/add-command`. A page that can't be replaced by typing
+   into the console is a design error.
+2. **Acting:** call `session.run("verb noun ...")`. It's echoed to the log, so the console shows what the
+   UI did. A control hands back a command line and `App` runs it.
 3. **Reading:** call `session.query(...)`, which is silent, and use typed `Output`. Never parse
    rendered text.
-4. **Never block the UI thread on the session.** Run the query on a thread and hand the result back
-   with `PostMessageW`, the way `view_loop` and `publish` do. Filling a window at startup or from a
-   hotkey works the same way.
-5. **Refreshing:** react to the `changed` signal through `view_loop`. Don't add timers to the UI.
-6. **Keep display logic pure.** Build text and rows in functions like `build_view` and `title`, and
-   unit test those. Win32 calls stay in thin wrappers.
+4. **Never block the UI thread on the session.** Run the query on a thread and send the result back as
+   an `Update`, as `App::fetch` and `view_loop` do, then call `request_repaint`.
+5. **Refreshing:** react to the `changed` signal through `view_loop`. No timers, and nothing that asks
+   for a repaint every frame.
+6. **Keep display logic pure.** Build text and rows in functions like `rows::build_rows` and
+   `pages::status_rows`, and unit test those.
 
-## Win32 notes
+## egui notes
 
-- Filter hotkeys in the message loop in `ui::run` so they work whichever control has focus. If the
-  key has a meaning to a focused control, it won't reach it, as with backtick and the dropdown.
-- Don't hold a `Mutex` across `SendMessageW`, because it can re-enter a window procedure.
-- Commit dropdown changes when it closes, not while arrowing through an open list. Skip a command if
-  the selection didn't change, so nothing extra reaches the log.
-- A visible window must not take focus unprompted: the player may be mid-match. Only foreground a
-  window in response to a user's key press.
-- Scale sizes with `scale`. Use the system message font, and Consolas for logs and reports.
+- Colours come from `theme::Palette`, never literals, so light and dark can't drift apart.
+- Global keys go in `App::hotkeys`, which runs first, so they work whichever control has focus.
+- Give every control an accessible name. `kittest` fails a test otherwise, and scripts find controls by
+  it through UI Automation.
+- Commit dropdown changes when it closes, not while arrowing. Skip a command if nothing changed.
+- Only take focus in response to a user's key press: the player may be mid-match.
 
 ## Text
 
@@ -41,6 +38,6 @@ design notes for the planned windows, so check it first.
 
 ## Verify
 
-Run `scripts/check.ps1`, then `/verify-live` to check it in the real app. Extend
-`scripts/live-test.ps1` with any new behaviour, and look at a screenshot rather than only asserting
-on text. Keep `CB_SELECTSTRING` working, since the test scripts drive the dropdown with it.
+Run `scripts/check.ps1`, which includes the UI tests in `src/ui/tests.rs`. Add a test there for new
+behaviour. Run `scripts/window-check.ps1` to look at the real window, then `/verify-live` to check it
+with real filters. Look at a screenshot rather than only asserting on text.

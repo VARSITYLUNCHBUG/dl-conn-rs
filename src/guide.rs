@@ -43,8 +43,7 @@ STEP 2: PICK YOUR SERVER FIRST
   1. Close the game if it's running.
   2. Choose your server in the dl-rs dropdown. Type to search by city, code or
      region.
-  3. If you use ExitLag, choose the same server there.
-  4. Start the game.
+  3. Start the game.
 
 Pick before the game starts, so the ping measurement it runs at startup already
 sees the block. A block can't move a game that's already connected to a relay
@@ -85,7 +84,7 @@ What each CHECK usually means:
 
   Primary isn't your pick
       The game connected somewhere else. Check that the log is from after your
-      pick, and that ExitLag is routing to the same server.
+      pick.
 
   Backup outside your open sites
       The game selected a relay that should have been blocked. If you cleared
@@ -95,10 +94,6 @@ What each CHECK usually means:
   No relay valid
       The game could reach no relay. Check that your pick has relays online, and
       that no other tool is blocking them.
-
-  Route slower than direct
-      ExitLag's path was slower than this PC's direct ping at that moment. Try
-      another route or server in ExitLag.
 
 If the report says there's no SDR connection, that test didn't use a relay and
 proves nothing about the route. One private lobby tested so far did connect
@@ -121,15 +116,26 @@ for blocking to work, only for the report and the route counter.
 WHAT THE TWO COUNTERS MEASURE
 
 Direct
-    A ping from this PC straight to your pick. It doesn't go through ExitLag, so
-    it can differ a lot from the game's real path. In one test it read 356 ms
-    while the game showed 136 ms. Don't read it as your in-game ping.
+    A ping from this PC straight to your pick. A game's real path can differ, so
+    don't read it as your in-game ping.
 
-ExitLag route
+Game
     The figure the game itself wrote to its log, with the time it was written.
     It's the last known value and it isn't live, because the game only logs it
-    when it measures or connects. It shows only while ExitLag is running, but a
-    running ExitLag doesn't prove that the game was boosted at that moment.
+    when it measures or connects. It needs the launch options from step 1.
+
+
+IF YOU USE EXITLAG
+
+You don't need ExitLag to use dl-rs. If you do use it:
+
+  1. Choose the same server in ExitLag as in dl-rs. A block can't change where
+     ExitLag routes.
+  2. The second counter is labelled ExitLag route while ExitLag is running. A
+     running ExitLag doesn't prove that the game was boosted at that moment.
+  3. Direct doesn't go through ExitLag, so the two can differ a lot.
+  4. If the report says the route looks slower than direct, try another route or
+     server in ExitLag.
 
 
 KEYS
@@ -137,8 +143,8 @@ KEYS
   F1    This help
   F2    Settings
   F3    Log report
-  `     Show or hide the console
-  Esc   Close this window, or cancel a dropdown search
+  `     Console
+  Esc   Back to Status, or cancel a dropdown search
 ";
 
 pub fn lines() -> Vec<String> {
@@ -167,5 +173,14 @@ mod tests {
         assert!(at("READ THE REPORT") < at("REAL MATCH"));
         assert!(at("REAL MATCH") < at("TURN LOGGING OFF"));
         assert!(text.contains("-condebug -lognetapi"));
+    }
+
+    #[test]
+    fn exitlag_is_only_in_its_own_section() {
+        let text = lines().join("\n");
+        let section = text.find("IF YOU USE EXITLAG").unwrap();
+        assert!(!text[..section].contains("ExitLag"));
+        let keys = text.find("KEYS").unwrap();
+        assert!(!text[keys..].contains("ExitLag"));
     }
 }

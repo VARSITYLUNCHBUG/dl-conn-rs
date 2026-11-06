@@ -1,9 +1,7 @@
-// Win32 helpers shared by the elevated test scripts: drive the app's windows, and attach to its
-// console to send real keystrokes and read the screen back.
-using System; using System.Text; using System.Drawing; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+// Win32 helpers shared by the test scripts.
+using System; using System.Text; using System.Drawing; using System.Runtime.InteropServices;
 public static class W {
   [DllImport("user32",CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string c,string t);
-  [DllImport("user32",CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr p,IntPtr a,string c,string t);
   [DllImport("user32",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h,StringBuilder s,int n);
   [DllImport("user32",CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h,uint m,IntPtr w,IntPtr l);
   [DllImport("user32",CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h,uint m,IntPtr w,string l);
@@ -11,40 +9,23 @@ public static class W {
   [DllImport("user32")] public static extern bool PostMessage(IntPtr h,uint m,IntPtr w,IntPtr l);
   [DllImport("user32")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32")] public static extern bool IsWindow(IntPtr h);
+  [DllImport("user32")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32")] static extern bool SetCursorPos(int x,int y);
   [DllImport("user32")] static extern void mouse_event(uint f,uint x,uint y,uint d,UIntPtr e);
   public static void Move(int x,int y){SetCursorPos(x,y);}
   public static void Click(int x,int y){SetCursorPos(x,y);System.Threading.Thread.Sleep(80);mouse_event(2,0,0,0,UIntPtr.Zero);mouse_event(4,0,0,0,UIntPtr.Zero);}
+  delegate bool EnumProc(IntPtr h,IntPtr l);
+  [DllImport("user32")] static extern bool EnumWindows(EnumProc f,IntPtr l);
+  [DllImport("user32")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
+  public static IntPtr TitledWindow(int pid){IntPtr found=IntPtr.Zero;EnumWindows((h,l)=>{uint p;GetWindowThreadProcessId(h,out p);if(p==pid&&IsWindowVisible(h)&&Title(h).StartsWith("dl-rs")){found=h;return false;}return true;},IntPtr.Zero);return found;}
+  [DllImport("user32")] static extern uint MapVirtualKey(uint code,uint map);
+  public static void PostKey(IntPtr h,uint vk){uint scan=MapVirtualKey(vk,0);PostMessage(h,0x100,(IntPtr)vk,(IntPtr)(1|(scan<<16)));PostMessage(h,0x101,(IntPtr)vk,(IntPtr)(int)(1|(scan<<16)|0xC0000000));}
   public static int[] Rect(IntPtr h){RECT r;GetWindowRect(h,out r);return new[]{r.L,r.T,r.R,r.B};}
   [DllImport("user32")] public static extern IntPtr GetDlgItem(IntPtr h,int id);
   [DllImport("user32")] public static extern bool GetWindowRect(IntPtr h,out RECT r);
   [DllImport("user32")] public static extern bool PrintWindow(IntPtr h,IntPtr dc,uint f);
-  [DllImport("user32")] public static extern IntPtr GetSystemMenu(IntPtr h,bool revert);
-  [DllImport("user32")] public static extern int GetMenuState(IntPtr m,uint id,uint flags);
   [StructLayout(LayoutKind.Sequential)] public struct RECT{public int L,T,R,B;}
   public static string Title(IntPtr h){var s=new StringBuilder(512);GetWindowText(h,s,512);return s.ToString();}
-  public static string Text(IntPtr h){var s=new StringBuilder(70000);SendMessage(h,0x0D,(IntPtr)70000,s);return s.ToString();}
-  public static string Item(IntPtr c,int i){var s=new StringBuilder(256);SendMessage(c,0x148,(IntPtr)i,s);return s.ToString();}
-  public static string Selected(IntPtr c){var i=SendMessage(c,0x147,IntPtr.Zero,IntPtr.Zero);var s=new StringBuilder(256);SendMessage(c,0x148,i,s);return s.ToString();}
   public static void Shot(IntPtr h,string path){RECT r;GetWindowRect(h,out r);using(var b=new Bitmap(r.R-r.L,r.B-r.T))using(var g=Graphics.FromImage(b)){var dc=g.GetHdc();PrintWindow(h,dc,2);g.ReleaseHdc(dc);b.Save(path);}}
-}
-public static class Con {
-  [DllImport("kernel32")] static extern bool FreeConsole();
-  [DllImport("kernel32")] static extern bool AllocConsole();
-  [DllImport("kernel32")] static extern bool AttachConsole(uint pid);
-  [DllImport("kernel32")] public static extern IntPtr GetConsoleWindow();
-  [DllImport("user32")] static extern bool ShowWindow(IntPtr h,int cmd);
-  [DllImport("kernel32",CharSet=CharSet.Unicode,SetLastError=true)] static extern SafeFileHandle CreateFile(string n,uint a,uint s,IntPtr sa,uint d,uint f,IntPtr t);
-  [DllImport("kernel32",EntryPoint="WriteConsoleInputW")] static extern bool WriteInput(SafeFileHandle h,Rec[] r,uint n,out uint w);
-  [DllImport("kernel32",EntryPoint="ReadConsoleOutputCharacterW",CharSet=CharSet.Unicode)] static extern bool ReadChars(SafeFileHandle h,StringBuilder s,uint n,Coord c,out uint r);
-  [DllImport("kernel32",EntryPoint="GetConsoleScreenBufferInfo")] static extern bool Info(SafeFileHandle h,out Buf b);
-  [StructLayout(LayoutKind.Sequential)] struct Coord{public short X,Y;}
-  [StructLayout(LayoutKind.Sequential)] struct Buf{public Coord Size,Cursor;public ushort Attr;public short L,T,R,B;public Coord Max;}
-  [StructLayout(LayoutKind.Explicit,Size=20)] struct Rec{[FieldOffset(0)]public ushort Type;[FieldOffset(4)]public int Down;[FieldOffset(8)]public ushort Repeat;[FieldOffset(10)]public ushort Vk;[FieldOffset(12)]public ushort Scan;[FieldOffset(14)]public ushort Ch;[FieldOffset(16)]public uint Ctrl;}
-  static SafeFileHandle Open(string n){var h=CreateFile(n,0xC0000000,3,IntPtr.Zero,3,0,IntPtr.Zero);if(h.IsInvalid)throw new Exception(n+" error "+Marshal.GetLastWin32Error());return h;}
-  public static bool Attach(uint pid){FreeConsole();return AttachConsole(pid);}
-  public static void Detach(){FreeConsole();AllocConsole();ShowWindow(GetConsoleWindow(),0);}
-  public static void Type(string text){using(var h=Open("CONIN$")){foreach(char c in text){ushort vk=(ushort)(c=='\t'?9:c=='\r'?13:c==(char)27?27:0);var recs=new Rec[2];for(int i=0;i<2;i++){recs[i].Type=1;recs[i].Down=i==0?1:0;recs[i].Repeat=1;recs[i].Vk=vk;recs[i].Ch=(ushort)c;}uint w;WriteInput(h,recs,2,out w);}}}
-  public static string[] Rows(){using(var h=Open("CONOUT$")){Buf b;Info(h,out b);var rows=new string[b.Cursor.Y+1];for(int y=0;y<=b.Cursor.Y;y++){var s=new StringBuilder(b.Size.X+1);uint r;var c=new Coord();c.Y=(short)y;ReadChars(h,s,(uint)b.Size.X,c,out r);rows[y]=s.ToString(0,(int)r).TrimEnd();}return rows;}}
 }

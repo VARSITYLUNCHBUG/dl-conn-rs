@@ -9,7 +9,6 @@ macro_rules! log {
 
 mod analysis;
 mod command;
-mod console;
 mod diag;
 mod editor;
 mod guide;

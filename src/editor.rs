@@ -1,22 +1,16 @@
-//! The console's input line as pure state: keys go in, instructions come out. No Windows calls.
+//! What the console's input line does beyond typing: history, completion and submitting. A text box
+//! owns the typing and hands its text over. No Windows calls.
 
 use crate::command::{self, Candidate, ServerName};
 
 const HISTORY_LIMIT: usize = 100;
+const INPUT_LIMIT: usize = 400;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Key {
-    Char(char),
     Enter,
-    Backspace,
-    Delete,
-    Left,
-    Right,
-    Home,
-    End,
     Up,
     Down,
-    /// Esc or Ctrl+C.
     Cancel,
 }
 
@@ -26,10 +20,6 @@ pub enum Action {
     Redraw,
     Submit(String),
     ShowCandidates(Vec<Candidate>),
-    /// `?` was pressed, with this line typed so far.
-    Help(String),
-    /// The console toggle key was pressed.
-    Toggle,
 }
 
 #[derive(Default)]
@@ -52,34 +42,29 @@ impl Editor {
         self.cursor
     }
 
-    /// Handles any key but Tab. `capacity` is how many characters fit on the console line.
-    pub fn key(&mut self, key: Key, capacity: usize) -> Action {
+    /// Takes the text and caret from the text box. Commands are plain ASCII, so anything else is
+    /// dropped, and a change means a second Tab no longer asks for a list.
+    pub fn set_input(&mut self, text: &str, cursor: usize) {
+        let line: String = text
+            .chars()
+            .filter(|c| (' '..='~').contains(c))
+            .take(INPUT_LIMIT)
+            .collect();
+        let cursor = cursor.min(line.len());
+        if line != self.line {
+            self.browsing = None;
+        }
+        if line != self.line || cursor != self.cursor {
+            self.tab_pending = false;
+        }
+        self.line = line;
+        self.cursor = cursor;
+    }
+
+    pub fn key(&mut self, key: Key) -> Action {
         self.tab_pending = false;
         match key {
-            Key::Char('`' | '~') => Action::Toggle,
-            Key::Char('?') => Action::Help(self.line.clone()),
-            Key::Char(c) if (' '..='~').contains(&c) && self.line.len() < capacity => {
-                self.line.insert(self.cursor, c);
-                self.cursor += 1;
-                self.browsing = None;
-                Action::Redraw
-            }
-            Key::Char(_) => Action::None,
             Key::Enter => self.submit(),
-            Key::Backspace if self.cursor > 0 => {
-                self.cursor -= 1;
-                self.line.remove(self.cursor);
-                Action::Redraw
-            }
-            Key::Delete if self.cursor < self.line.len() => {
-                self.line.remove(self.cursor);
-                Action::Redraw
-            }
-            Key::Backspace | Key::Delete => Action::None,
-            Key::Left => self.move_to(self.cursor.saturating_sub(1)),
-            Key::Right => self.move_to((self.cursor + 1).min(self.line.len())),
-            Key::Home => self.move_to(0),
-            Key::End => self.move_to(self.line.len()),
             Key::Up => self.browse_older(),
             Key::Down => self.browse_newer(),
             Key::Cancel => {
@@ -164,14 +149,6 @@ impl Editor {
         Action::Redraw
     }
 
-    fn move_to(&mut self, cursor: usize) -> Action {
-        if cursor == self.cursor {
-            return Action::None;
-        }
-        self.cursor = cursor;
-        Action::Redraw
-    }
-
     fn set_line(&mut self, line: String) {
         self.cursor = line.len();
         self.line = line;
@@ -204,8 +181,6 @@ fn common_prefix(candidates: &[Candidate]) -> String {
 mod tests {
     use super::*;
 
-    const CAPACITY: usize = 40;
-
     fn servers() -> Vec<ServerName> {
         [
             ("sto", "Stockholm"),
@@ -219,73 +194,36 @@ mod tests {
 
     fn typed(text: &str) -> Editor {
         let mut editor = Editor::default();
-        for c in text.chars() {
-            editor.key(Key::Char(c), CAPACITY);
-        }
+        editor.set_input(text, text.len());
         editor
     }
 
     #[test]
-    fn typing_and_editing() {
-        let mut editor = typed("set pck");
-        editor.key(Key::Left, CAPACITY);
-        editor.key(Key::Left, CAPACITY);
-        editor.key(Key::Char('i'), CAPACITY);
-        assert_eq!(editor.line(), "set pick");
-        assert_eq!(editor.cursor(), 6);
-        editor.key(Key::Backspace, CAPACITY);
-        assert_eq!(editor.line(), "set pck");
-        editor.key(Key::Delete, CAPACITY);
-        assert_eq!(editor.line(), "set pk");
-        editor.key(Key::Home, CAPACITY);
-        assert_eq!(editor.cursor(), 0);
-        assert_eq!(editor.key(Key::Backspace, CAPACITY), Action::None);
-        assert_eq!(editor.key(Key::Left, CAPACITY), Action::None);
-        editor.key(Key::End, CAPACITY);
-        assert_eq!(editor.cursor(), 6);
-        assert_eq!(editor.key(Key::Right, CAPACITY), Action::None);
-        assert_eq!(editor.key(Key::Delete, CAPACITY), Action::None);
-    }
-
-    #[test]
-    fn input_is_limited_to_capacity_and_printable_ascii() {
+    fn input_is_limited_to_printable_ascii_of_a_set_length() {
         let mut editor = Editor::default();
-        for _ in 0..5 {
-            editor.key(Key::Char('a'), 3);
-        }
-        assert_eq!(editor.line(), "aaa");
-        assert_eq!(editor.key(Key::Char('\u{e9}'), CAPACITY), Action::None);
-        assert_eq!(editor.key(Key::Char('\u{7}'), CAPACITY), Action::None);
+        editor.set_input("ab\u{e9}\u{7}c", 99);
+        assert_eq!(editor.line(), "abc");
+        assert_eq!(editor.cursor(), 3, "the caret stays inside the line");
+        editor.set_input(&"a".repeat(INPUT_LIMIT + 5), 0);
+        assert_eq!(editor.line().len(), INPUT_LIMIT);
     }
 
     #[test]
     fn enter_submits_trimmed_and_clears() {
         let mut editor = typed("  clear pick ");
         assert_eq!(
-            editor.key(Key::Enter, CAPACITY),
+            editor.key(Key::Enter),
             Action::Submit("clear pick".to_string())
         );
         assert_eq!(editor.line(), "");
         assert_eq!(editor.cursor(), 0);
-        assert_eq!(editor.key(Key::Enter, CAPACITY), Action::None);
-    }
-
-    #[test]
-    fn special_keys_leave_the_line_alone() {
-        let mut editor = typed("set");
-        assert_eq!(
-            editor.key(Key::Char('?'), CAPACITY),
-            Action::Help("set".to_string())
-        );
-        assert_eq!(editor.key(Key::Char('`'), CAPACITY), Action::Toggle);
-        assert_eq!(editor.key(Key::Char('~'), CAPACITY), Action::Toggle);
-        assert_eq!(editor.line(), "set");
+        assert_eq!(editor.key(Key::Enter), Action::None);
     }
 
     #[test]
     fn cancel_clears_the_line() {
         let mut editor = typed("set pick");
-        editor.key(Key::Cancel, CAPACITY);
+        editor.key(Key::Cancel);
         assert_eq!(editor.line(), "");
         assert_eq!(editor.cursor(), 0);
     }
@@ -293,37 +231,31 @@ mod tests {
     #[test]
     fn history_browses_and_restores_the_draft() {
         let mut editor = typed("show status");
-        editor.key(Key::Enter, CAPACITY);
-        for c in "clear pick".chars() {
-            editor.key(Key::Char(c), CAPACITY);
-        }
-        editor.key(Key::Enter, CAPACITY);
-        for c in "draft".chars() {
-            editor.key(Key::Char(c), CAPACITY);
-        }
-        editor.key(Key::Up, CAPACITY);
+        editor.key(Key::Enter);
+        editor.set_input("clear pick", 10);
+        editor.key(Key::Enter);
+        editor.set_input("draft", 5);
+        editor.key(Key::Up);
         assert_eq!(editor.line(), "clear pick");
-        editor.key(Key::Up, CAPACITY);
+        editor.key(Key::Up);
         assert_eq!(editor.line(), "show status");
-        assert_eq!(editor.key(Key::Up, CAPACITY), Action::None);
-        editor.key(Key::Down, CAPACITY);
+        assert_eq!(editor.key(Key::Up), Action::None);
+        editor.key(Key::Down);
         assert_eq!(editor.line(), "clear pick");
-        editor.key(Key::Down, CAPACITY);
+        editor.key(Key::Down);
         assert_eq!(editor.line(), "draft");
-        assert_eq!(editor.key(Key::Down, CAPACITY), Action::None);
+        assert_eq!(editor.key(Key::Down), Action::None);
     }
 
     #[test]
     fn history_skips_immediate_repeats() {
         let mut editor = Editor::default();
         for _ in 0..2 {
-            for c in "quit".chars() {
-                editor.key(Key::Char(c), CAPACITY);
-            }
-            editor.key(Key::Enter, CAPACITY);
+            editor.set_input("quit", 4);
+            editor.key(Key::Enter);
         }
-        editor.key(Key::Up, CAPACITY);
-        assert_eq!(editor.key(Key::Up, CAPACITY), Action::None);
+        editor.key(Key::Up);
+        assert_eq!(editor.key(Key::Up), Action::None);
     }
 
     #[test]
@@ -365,9 +297,9 @@ mod tests {
     fn typing_between_tabs_resets_the_list_request() {
         let mut editor = typed("s");
         editor.tab(&servers());
-        editor.key(Key::Left, CAPACITY);
-        editor.key(Key::End, CAPACITY);
-        assert_eq!(editor.tab(&servers()), Action::None);
+        editor.set_input("st", 2);
+        assert_eq!(editor.tab(&servers()), Action::None, "no list yet");
+        assert!(matches!(editor.tab(&servers()), Action::ShowCandidates(_)));
     }
 
     #[test]
@@ -391,10 +323,8 @@ mod tests {
 
     #[test]
     fn tab_mid_line_keeps_the_rest() {
-        let mut editor = typed("li servers");
-        for _ in 0.."servers".len() + 1 {
-            editor.key(Key::Left, CAPACITY);
-        }
+        let mut editor = Editor::default();
+        editor.set_input("li servers", 2);
         editor.tab(&servers());
         assert_eq!(editor.line(), "list servers");
         assert_eq!(editor.cursor(), 4);

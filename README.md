@@ -1,9 +1,14 @@
 # dl-rs
 
 Pick one Steam relay region. Everything else is blocked until you pick again or restart the PC.
-Built to run alongside ExitLag. Windows 10 or later, x64. One exe of about 590 KB with no installer
-and no runtime dependencies. It asks for admin rights when it starts. Settings you change are saved
-in `%LOCALAPPDATA%\dl-rs\settings.ini`. Nothing else goes to disk.
+Works with or without ExitLag.
+
+**Needs:** Windows 10 or 11, or Server 2016 or later, x64, with DirectX 12. A PC with no usable GPU
+falls back to the Windows software renderer. There's no installer: one exe of about 7 MB that asks for
+admin rights when it starts. Windows 7 and 8.1 aren't supported.
+
+Settings and a capped log are kept in your local app data folder under `dl-rs`. To remove the app,
+delete the exe and that folder. A block lasts until you restart.
 
 ## Use
 
@@ -11,31 +16,34 @@ Choose a server from the dropdown. Sites are grouped by region, and typing narro
 name, code or region. Enter picks the highlighted site, and Esc cancels the search. The title bar
 shows what's active. Choose **No block** to undo it.
 
-Closing the app leaves the block in place. Reopening it picks up where you left off.
+Closing the app leaves the block in place, unless you set `clear_on_exit`. Reopening it picks up where
+you left off.
 
 Don't run another server picker at the same time. Its firewall rules still apply, so it can
 block the server you picked here.
 
-| Key | Window |
+| Key | Page |
 | --- | --- |
 | `F1` | Help: how to set launch options, test in a custom game, and read the results |
 | `F2` | Settings |
 | `F3` | Log report: reads the game's log and checks it against your pick |
 | \` | Console |
+| `Esc` | Back to Status, or cancel a search |
 
-These work while dl-rs has focus. They aren't global hotkeys.
+These work while dl-rs has focus. They aren't global hotkeys. The theme switch at the top follows
+Windows, or stays light or dark.
 
 ## Ping counters
 
 Two lines under the dropdown:
 
-- **Direct:** a ping from this PC to your pick. It doesn't go through ExitLag, so it can differ a lot
-  from the game's real path. The last value holds for two missed pings, because single misses are
-  common.
-- **ExitLag route:** the figure the game wrote to its log, with its time. It's the last known value,
-  not a live reading, because the game only logs it when it measures or connects. It needs
-  `-condebug` in the game's launch options. It shows only while ExitLag is running, but a running
-  ExitLag doesn't prove the game was boosted at that moment.
+- **Direct:** a ping from this PC to your pick. A game's real path can differ, especially through a
+  routing tool, so don't read it as your in-game ping. The last value holds for two missed pings,
+  because single misses are common.
+- **Game:** the figure the game wrote to its log, with its time. It's the last known value, not a live
+  reading, because the game only logs it when it measures or connects. It needs `-condebug` in the
+  game's launch options. It's labelled **ExitLag route** while ExitLag is running, but a running ExitLag
+  doesn't prove the game was boosted at that moment.
 
 ## Settings
 
@@ -51,6 +59,7 @@ choosing a route.
 | `report_every` | `1` to `3600` s | `5` | Console report interval |
 | `report_on_open` | `on`, `off` | `on` | Start the report when the console opens |
 | `clear_on_exit` | `on`, `off` | `off` | Remove the block when dl-rs closes |
+| `theme` | `system`, `light`, `dark` | `system` | How the window looks |
 | `log_path` | `auto` or a path | `auto` | The log to read. `auto` finds Deadlock's. Other games are untested |
 
 A damaged settings file falls back to defaults and never changes a block.
@@ -64,7 +73,7 @@ top are marked `OK`, `CHECK` or `NOTE`. Steam IDs and player names are left out.
 
 ## Console
 
-Press **\`** (backtick) to show or hide the console. It's mainly a live log, with a prompt at the
+Press **\`** (backtick) to open or close the console page. It's mainly a live log, with a prompt at the
 bottom for commands. While it's open, a report repeats every 5 seconds by default, showing processes, the pick,
 relay latency and routes, and any traffic stopped, such as `blocked deadlock.exe -> waw`. Use
 `stop report` for quiet.
@@ -101,8 +110,8 @@ up in the log.
 | `Tab` | Complete a word. A second `Tab` lists the options |
 | `?` | Explain what you've typed so far |
 | `Up` / `Down` | Command history |
-| `Esc` / `Ctrl+C` | Clear the line |
-| \` | Hide the console |
+| `Esc` | Clear the line, then go back to Status |
+| \` | Close the console |
 
 Servers complete by code or by name, so `set pick frank<Tab>` offers the Frankfurt sites.
 
@@ -111,31 +120,24 @@ one relay. To keep a failover route, name a second site: `set pick sgp --backup 
 open and everything else is blocked. A later pick without `--backup`, including any dropdown choice,
 goes back to the `backup` setting, which is strict blocking by default.
 
-The console's X button is removed because Windows ends the whole app when a console closes. Use
-\` to hide it. Show and hide assume a classic console window; with Windows Terminal set as the
-default on Windows 11, hiding may not work.
-
 ## Design
 
-Commands are the only way to act on the app. The windows and console are thin front-ends over one
-session that runs commands one at a time.
+Commands are the only way to act on the app. The window and its console page are thin front-ends over
+one session that runs commands one at a time.
 
 ```
-dropdown ─┐  command lines
-          ├───────────────> command.rs parses ──> session.rs ──> wfp / sdr / diag
-console ──┘                                            │
-    ^                 log.rs <──────── lines ──────────┤
-    └───────── reads ──┘                               └─ "changed" ─> dropdown queries again
+window --- command lines --> command.rs parses --> session.rs --> wfp / sdr / diag / analysis
+  ^                                                    |
+  +----------- "changed", then it queries again -------+--> log.rs --> console page, dl-rs.log
 ```
 
 | File | Purpose |
 | --- | --- |
 | `src/command.rs` | The command table, which drives parsing, help and completion |
 | `src/session.rs` | Runs commands, and owns the relays, pick and refresh loop |
-| `src/log.rs` | The log buffer |
-| `src/editor.rs` | The console's input line, as pure state |
-| `src/console.rs` | The real console and its I/O thread |
-| `src/ui/` | The main window, dropdown, and the F1, F2 and F3 windows |
+| `src/log.rs` | The log buffer and its capped file |
+| `src/editor.rs` | The console prompt's history and completion, as pure state |
+| `src/ui/` | The egui window: dropdown, counters, pages and themes |
 | `src/settings.rs` | What each setting means, validation and the settings file |
 | `src/analysis.rs` | The log parser and report |
 | `src/monitor.rs` | The ping counters' thread |
@@ -160,13 +162,14 @@ To add a command, add a `Spec` to the table in `command.rs` and handle its `Comm
 - **Atomic and quiet:** each change is one transaction, so there's never a half-applied state.
   Filters are only rewritten when the result would differ, because every write makes Windows
   re-check all live flows.
+- **Only IPv4:** Steam's relay configs list IPv4 addresses only, so IPv4 filters cover them.
 - **Until reboot:** filters are WFP's default "static" objects, which last until deleted or until
-  the filtering service stops. Nothing goes to the firewall rule store or to disk, and the active
-  pick is read back from WFP itself.
+  the filtering service stops. Nothing goes to the firewall rule store, and the active pick is read
+  back from WFP itself.
 
 ## ExitLag
 
-ExitLag's traffic to its own servers isn't touched, because only Valve relay addresses are matched.
+You don't need ExitLag. If you use it, its traffic to its own servers isn't touched, because only Valve relay addresses are matched.
 
 Blocks work on a game boosted through ExitLag. In a live Deadlock session routed to Singapore, the
 game's traffic reached the network only as tunnels to ExitLag's nodes, yet its packets to other
@@ -193,19 +196,24 @@ cargo build --release
 cargo test
 ```
 
-`cargo test` runs the unit tests. The live tests need admin rights and use real filters and real
-keystrokes. They briefly block real relays and one public DNS resolver, and open the app's windows:
+`cargo test` runs the unit tests and drives the real UI code in-process with a fake firewall.
+
+`scripts/window-check.ps1` opens the real window with a fake firewall and measures it. It needs no
+admin rights and can't change a block, so it works with a game running:
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\window-check.ps1 -TestExe <target\debug\deps\dl_rs-*.exe> -OutDir <dir>
+```
+
+The live test needs admin rights, uses real filters, and moves the mouse near the end. It briefly blocks
+real relays and one public DNS resolver:
 
 ```
 powershell -ExecutionPolicy Bypass -File scripts\live-test.ps1 -TestExe <target\debug\deps\dl_rs-*.exe> -AppExe <target\release\dl-rs.exe> -OutDir <dir>
 ```
 
-`scripts/ui-test.ps1` drives the real windows with a fake firewall. It needs no admin rights and can't
-change a block, so it works with a game running:
-
-```
-powershell -ExecutionPolicy Bypass -File scripts\ui-test.ps1 -TestExe <target\debug\deps\dl_rs-*.exe> -OutDir <dir>
-```
+`scripts/release.ps1` builds what you give to other people, with build paths removed, and signs it if
+`DL_RS_SIGN_THUMBPRINT` is set. `docs/release-checklist.md` lists what only a person can check.
 
 `scripts/load-sim.ps1` sends game-shaped UDP from `examples/loadsim.rs` and counts what reaches the
 network card with `pktmon`. Its rates are capped because it reaches real relays. Its `game` scenario

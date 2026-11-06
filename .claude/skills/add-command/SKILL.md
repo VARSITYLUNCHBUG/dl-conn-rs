@@ -41,6 +41,7 @@ Add to the existing `tests` modules:
 - Bad data or errors must never lift a block.
 - User-facing text is plain ASCII, with no emoji or em dashes.
 - Output must not claim more than was measured. See "Facts learned the hard way" in `CLAUDE.md`.
+- Nothing can assume ExitLag, Steam or a fixed path on this PC.
 
 ## Finish
 

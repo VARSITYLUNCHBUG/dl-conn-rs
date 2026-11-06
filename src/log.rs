@@ -1,16 +1,19 @@
-//! The app's log: a capped buffer that anything can write to and the console drains.
+//! The app's log: a capped buffer that anything can write to and the console page drains, plus a
+//! capped file, so there's a record after a crash or a support question.
 
-use std::ffi::c_void;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::mem::zeroed;
-use std::ptr::null_mut;
+use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use windows_sys::Win32::Foundation::SYSTEMTIME;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-use windows_sys::Win32::System::Threading::SetEvent;
 
 /// Enough history to replay when the console first opens, without growing forever if it never does.
 const CAPACITY: usize = 1 << 20;
+/// The file is replaced once it reaches this, keeping one old copy, so it can't grow forever.
+const FILE_CAPACITY: u64 = 1 << 20;
+const OLD_SUFFIX: &str = ".old";
 
 struct Pending {
     text: String,
@@ -21,7 +24,61 @@ static PENDING: Mutex<Pending> = Mutex::new(Pending {
     text: String::new(),
     clear: false,
 });
-static WAKE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+type Wake = Box<dyn Fn() + Send + Sync>;
+static WAKE: Mutex<Option<Wake>> = Mutex::new(None);
+static FILE: Mutex<Option<LogFile>> = Mutex::new(None);
+
+struct LogFile {
+    path: PathBuf,
+    file: File,
+    written: u64,
+}
+
+impl LogFile {
+    fn open(path: PathBuf) -> std::io::Result<Self> {
+        if let Some(folder) = path.parent() {
+            fs::create_dir_all(folder)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let written = file.metadata()?.len();
+        Ok(Self {
+            path,
+            file,
+            written,
+        })
+    }
+
+    /// Failing to write must never affect the app, so errors are ignored.
+    fn write(&mut self, text: &str) {
+        if self.written + text.len() as u64 > FILE_CAPACITY {
+            let mut old = self.path.clone().into_os_string();
+            old.push(OLD_SUFFIX);
+            let _ = fs::rename(&self.path, old);
+            if let Ok(fresh) = Self::open(self.path.clone()) {
+                *self = fresh;
+            }
+        }
+        if self.file.write_all(text.as_bytes()).is_ok() {
+            self.written += text.len() as u64;
+        }
+    }
+}
+
+/// Starts keeping the log in this file as well.
+pub fn to_file(path: PathBuf) {
+    if let Ok(file) = LogFile::open(path) {
+        *FILE.lock().unwrap() = Some(file);
+    }
+}
+
+/// Writes to the file only, without waiting on anything a panicking thread might hold.
+pub fn emergency(text: &str) {
+    if let Ok(mut file) = FILE.try_lock()
+        && let Some(file) = file.as_mut()
+    {
+        file.write(&format!("{text}\r\n"));
+    }
+}
 
 /// Adds a timestamped line.
 pub fn line(text: String) {
@@ -30,12 +87,16 @@ pub fn line(text: String) {
         GetLocalTime(&mut time);
         time
     };
+    let stamped = format!(
+        "{:02}:{:02}:{:02}.{:03} {text}\r\n",
+        time.wHour, time.wMinute, time.wSecond, time.wMilliseconds
+    );
+    if let Some(file) = FILE.lock().unwrap().as_mut() {
+        file.write(&stamped);
+    }
     {
         let mut pending = PENDING.lock().unwrap();
-        pending.text.push_str(&format!(
-            "{:02}:{:02}:{:02}.{:03} {text}\r\n",
-            time.wHour, time.wMinute, time.wSecond, time.wMilliseconds
-        ));
+        pending.text.push_str(&stamped);
         trim(&mut pending.text);
     }
     wake();
@@ -60,16 +121,15 @@ pub fn drain() -> (bool, String) {
     )
 }
 
-/// Sets the event signalled whenever there is something to drain.
-pub fn set_wake(event: *mut c_void) {
-    WAKE.store(event, Ordering::Release);
+/// Sets what's called whenever there is something to drain.
+pub fn set_wake(callback: Wake) {
+    *WAKE.lock().unwrap() = Some(callback);
     wake();
 }
 
 fn wake() {
-    let event = WAKE.load(Ordering::Acquire);
-    if !event.is_null() {
-        unsafe { SetEvent(event) };
+    if let Some(callback) = WAKE.lock().unwrap().as_ref() {
+        callback();
     }
 }
 
@@ -95,6 +155,23 @@ mod tests {
         assert!(text.len() <= CAPACITY);
         assert!(text.starts_with("old line"));
         assert!(text.ends_with("newest\r\n"));
+    }
+
+    #[test]
+    fn the_file_is_capped_and_keeps_one_old_copy() {
+        let folder = std::env::temp_dir().join(format!("dl-rs-log-{}", std::process::id()));
+        let path = folder.join("nested").join("dl-rs.log");
+        let mut file = LogFile::open(path.clone()).unwrap();
+        file.write("first\r\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first\r\n");
+        file.written = FILE_CAPACITY;
+        file.write("second\r\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second\r\n");
+        let mut old = path.clone().into_os_string();
+        old.push(OLD_SUFFIX);
+        assert_eq!(fs::read_to_string(old).unwrap(), "first\r\n");
+        drop(file);
+        fs::remove_dir_all(&folder).unwrap();
     }
 
     #[test]

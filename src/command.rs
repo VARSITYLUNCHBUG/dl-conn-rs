@@ -252,7 +252,7 @@ static COMMANDS: &[Spec] = &[
         verb: "toggle",
         noun: "console",
         params: &[],
-        summary: "Show or hide this console, and its report with it",
+        summary: "Open or close the console page, and its report with it",
         build: |_| Ok(Command::ToggleConsole),
     },
     Spec {
@@ -520,7 +520,8 @@ pub fn help(topic: Option<&str>) -> Result<Vec<String>, String> {
     let Some(topic) = topic else {
         let mut lines = table(COMMANDS.iter());
         lines.push(String::new());
-        lines.push("Tab completes. ? explains what you've typed. ` hides the console.".to_string());
+        lines
+            .push("Tab completes. ? explains what you've typed. ` closes the console.".to_string());
         return Ok(lines);
     };
     let words = lower_words(topic);
@@ -697,6 +698,7 @@ fn values_for(key: &str, word: &str, servers: &[ServerName]) -> Vec<Candidate> {
     match settings::kind(key) {
         Some(settings::Kind::Toggle) => fixed(&["off", "on"]),
         Some(settings::Kind::Path) => fixed(&["auto"]),
+        Some(settings::Kind::Theme) => fixed(&["dark", "light", "system"]),
         Some(settings::Kind::Server) => {
             let mut values = fixed(&["none"]);
             values.extend(matching_servers(word, servers));
@@ -933,6 +935,7 @@ mod tests {
         assert_eq!(texts("set config hold_in_game "), ["off", "on"]);
         assert_eq!(texts("set config clear_on_exit o"), ["off", "on"]);
         assert_eq!(texts("set config log_path "), ["auto"]);
+        assert_eq!(texts("set config theme "), ["dark", "light", "system"]);
         assert_eq!(texts("set config backup j"), ["jnb"]);
         assert_eq!(texts("set config backup no"), ["none"]);
         assert!(texts("set config ping_every ").is_empty());

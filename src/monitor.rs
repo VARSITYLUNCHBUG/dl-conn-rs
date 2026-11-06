@@ -1,23 +1,25 @@
 //! The two ping counters: direct pings to the pick, and the game's own figure from its log.
 //!
 //! This runs on its own thread so a slow ping never holds up commands. The direct figure is a real
-//! measurement of this PC's path, which doesn't go through ExitLag. The route figure is the last
-//! one the game wrote, because nothing else can see ExitLag's path.
+//! measurement of this PC's path. The game's figure is the last one it wrote, and it's the only one
+//! that sees a routing tool such as ExitLag, if one is in use. Nothing here needs ExitLag or Steam.
 
 use crate::analysis::{LiveRoute, Route, RouteState};
 use crate::diag;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// A file's first bytes identify it, because the game rewrites the log on each launch.
 const HEAD_BYTES: usize = 64;
 /// The log only needs checking about as often as someone could notice the counter change.
 const LOG_EVERY: Duration = Duration::from_secs(5);
+/// Looking for a log that isn't there means reading the registry and Steam's files.
+const SEARCH_EVERY: Duration = Duration::from_secs(30);
 /// On a first read, skip most of a huge log. Its end holds the current state.
 const MAX_FIRST_READ: u64 = 16 << 20;
 /// The last value holds for this many misses, because single ICMP failures are common here.
@@ -44,28 +46,33 @@ pub struct Monitor {
     pub route: Option<Route>,
 }
 
-/// The direct counter's text.
-pub fn direct_label(pick: &str, direct: &Direct) -> String {
-    match direct {
+/// The direct counter's text. ExitLag is only mentioned when it's running.
+pub fn direct_label(pick: &str, monitor: &Monitor) -> String {
+    match monitor.direct {
         Direct::Off => "Direct: off, ping interval is 0".to_string(),
-        Direct::NoPick => "Direct: pick a server".to_string(),
-        Direct::Waiting => format!("Direct: measuring {pick}"),
-        Direct::Ms(ms) => format!("Direct: {ms} ms to {pick} (this PC, not through ExitLag)"),
+        _ if pick.is_empty() => "Direct: pick a server".to_string(),
+        Direct::NoPick | Direct::Waiting => format!("Direct: measuring {pick}"),
+        Direct::Ms(ms) if monitor.exitlag => {
+            format!("Direct: {ms} ms to {pick} (this PC, not through ExitLag)")
+        }
+        Direct::Ms(ms) => format!("Direct: {ms} ms to {pick} (ping from this PC)"),
         Direct::BlockedLocally => format!("Direct: {pick} blocked by a filter on this PC"),
         Direct::NoReply => format!("Direct: no reply from {pick}"),
     }
 }
 
-/// The route counter's text. It always says where the figure came from and when.
+/// The game's figure as text. It always says where it came from and when.
 pub fn route_label(pick: &str, monitor: &Monitor) -> String {
-    if !monitor.exitlag {
-        return "ExitLag route: not running".to_string();
-    }
+    let name = if monitor.exitlag {
+        "ExitLag route"
+    } else {
+        "Game"
+    };
     if !monitor.log_found {
-        return "ExitLag route: no game log found, see F1".to_string();
+        return format!("{name}: turn on logging to see this, press F1");
     }
     let Some(route) = &monitor.route else {
-        return "ExitLag route: no game data yet, see F1".to_string();
+        return format!("{name}: no game data yet, press F1");
     };
     let when = match route.state {
         RouteState::InMatch => "in match",
@@ -78,7 +85,7 @@ pub fn route_label(pick: &str, monitor: &Monitor) -> String {
         ""
     };
     format!(
-        "ExitLag route: {} ms to {}{other}, {when} at {} (game log, not live)",
+        "{name}: {} ms to {}{other}, {when} at {} (game log, not live)",
         route.ms, route.site, route.at
     )
 }
@@ -142,6 +149,9 @@ impl DirectTracker {
 struct LogTail {
     configured: Option<String>,
     path: Option<PathBuf>,
+    next_search: Option<Instant>,
+    /// The file's size and time when last read, so an unchanged log isn't opened.
+    seen: Option<(u64, SystemTime)>,
     offset: u64,
     head: Vec<u8>,
     partial: Vec<u8>,
@@ -150,6 +160,7 @@ struct LogTail {
 
 impl LogTail {
     fn restart(&mut self) {
+        self.seen = None;
         self.offset = 0;
         self.head.clear();
         self.partial.clear();
@@ -188,27 +199,44 @@ impl LogTail {
 
     /// Reads new lines. Returns whether a log was found.
     fn poll(&mut self, configured: Option<&str>) -> bool {
-        // Searching means reading the registry and Steam's files, so reuse a path that still works.
+        let same_setting = self.configured.as_deref() == configured;
         let known = self
             .path
             .clone()
-            .filter(|path| self.configured.as_deref() == configured && path.is_file());
-        let Some(path) = known.or_else(|| diag::find_log(configured).ok()) else {
-            self.path = None;
-            self.restart();
-            return false;
+            .filter(|path| same_setting && path.is_file());
+        let path = match known {
+            Some(path) => path,
+            None => {
+                let now = Instant::now();
+                if same_setting && self.next_search.is_some_and(|next| now < next) {
+                    return false;
+                }
+                self.next_search = Some(now + SEARCH_EVERY);
+                self.configured = configured.map(str::to_string);
+                let Ok(path) = diag::find_log(configured) else {
+                    self.path = None;
+                    self.restart();
+                    return false;
+                };
+                path
+            }
         };
         if self.path.as_ref() != Some(&path) {
             self.path = Some(path.clone());
             self.restart();
         }
-        self.configured = configured.map(str::to_string);
         self.read_new(&path).is_ok()
     }
 
     fn read_new(&mut self, path: &Path) -> std::io::Result<()> {
+        let metadata = fs::metadata(path)?;
+        let now_seen = Some((metadata.len(), metadata.modified()?));
+        if self.seen == now_seen {
+            return Ok(());
+        }
+        self.seen = now_seen;
         let mut file: File = diag::open_shared(path)?;
-        let length = file.metadata()?.len();
+        let length = metadata.len();
         let mut head = vec![0; HEAD_BYTES];
         let got = file.read(&mut head)?;
         head.truncate(got);
@@ -255,12 +283,9 @@ fn run(
     loop {
         let now = Instant::now();
         if now >= next_log {
-            // The route figure only shows with ExitLag running, so the log isn't touched otherwise.
             state.exitlag = diag::exitlag_running();
-            if state.exitlag {
-                state.log_found = tail.poll(log_path.as_deref());
-                state.route = tail.route.current(&pick);
-            }
+            state.log_found = tail.poll(log_path.as_deref());
+            state.route = tail.route.current(&pick);
             next_log = now + LOG_EVERY;
         }
         if ping_every == 0 {
@@ -367,17 +392,69 @@ mod tests {
         );
     }
 
+    fn direct(direct: Direct) -> Monitor {
+        Monitor {
+            direct,
+            ..Monitor::default()
+        }
+    }
+
     #[test]
     fn direct_labels_say_what_they_measure() {
         assert_eq!(
-            direct_label("sgp", &Direct::Ms(356)),
+            direct_label("sgp", &direct(Direct::Ms(356))),
+            "Direct: 356 ms to sgp (ping from this PC)"
+        );
+        assert_eq!(
+            direct_label("", &direct(Direct::NoPick)),
+            "Direct: pick a server"
+        );
+        assert!(direct_label("sgp", &direct(Direct::Off)).contains("off"));
+        assert!(direct_label("sgp", &direct(Direct::NoReply)).contains("no reply from sgp"));
+        assert!(direct_label("sgp", &direct(Direct::BlockedLocally)).contains("filter"));
+        assert!(direct_label("sgp", &direct(Direct::Waiting)).contains("measuring"));
+        assert!(direct_label("sgp", &direct(Direct::NoPick)).contains("measuring"));
+        assert_eq!(
+            direct_label("", &direct(Direct::NoReply)),
+            "Direct: pick a server",
+            "a figure from before the block was cleared isn't shown"
+        );
+    }
+
+    #[test]
+    fn exitlag_is_only_mentioned_while_it_runs() {
+        let with = Monitor {
+            exitlag: true,
+            ..direct(Direct::Ms(356))
+        };
+        assert_eq!(
+            direct_label("sgp", &with),
             "Direct: 356 ms to sgp (this PC, not through ExitLag)"
         );
-        assert_eq!(direct_label("", &Direct::NoPick), "Direct: pick a server");
-        assert!(direct_label("sgp", &Direct::Off).contains("off"));
-        assert!(direct_label("sgp", &Direct::NoReply).contains("no reply from sgp"));
-        assert!(direct_label("sgp", &Direct::BlockedLocally).contains("filter"));
-        assert!(direct_label("sgp", &Direct::Waiting).contains("measuring"));
+        for monitor in [
+            Monitor::default(),
+            direct(Direct::Ms(356)),
+            Monitor {
+                log_found: true,
+                route: Some(route(RouteState::InMatch, "sgp")),
+                ..direct(Direct::Ms(356))
+            },
+        ] {
+            assert!(!direct_label("sgp", &monitor).contains("ExitLag"));
+            assert!(!route_label("sgp", &monitor).contains("ExitLag"));
+        }
+    }
+
+    #[test]
+    fn the_game_figure_shows_without_exitlag() {
+        let monitor = Monitor {
+            exitlag: false,
+            ..running(Some(route(RouteState::InMatch, "sgp")))
+        };
+        assert_eq!(
+            route_label("sgp", &monitor),
+            "Game: 121 ms to sgp, in match at 18:46 (game log, not live)"
+        );
     }
 
     #[test]
@@ -405,10 +482,10 @@ mod tests {
     }
 
     #[test]
-    fn route_labels_cover_having_nothing_to_show() {
+    fn labels_cover_having_nothing_to_show() {
         assert_eq!(
             route_label("sgp", &Monitor::default()),
-            "ExitLag route: not running"
+            "Game: turn on logging to see this, press F1"
         );
         assert_eq!(
             route_label(
@@ -418,21 +495,12 @@ mod tests {
                     ..Monitor::default()
                 }
             ),
-            "ExitLag route: no game log found, see F1"
+            "ExitLag route: turn on logging to see this, press F1"
         );
         assert_eq!(
             route_label("sgp", &running(None)),
-            "ExitLag route: no game data yet, see F1"
+            "ExitLag route: no game data yet, press F1"
         );
-    }
-
-    #[test]
-    fn exitlag_being_closed_hides_an_old_figure() {
-        let monitor = Monitor {
-            exitlag: false,
-            ..running(Some(route(RouteState::InMatch, "sgp")))
-        };
-        assert_eq!(route_label("sgp", &monitor), "ExitLag route: not running");
     }
 
     const LOCATION: &[u8] = b"11/05 18:46:31 [SteamNetSockets] Ping location: sgp=120+12/121+12\n";

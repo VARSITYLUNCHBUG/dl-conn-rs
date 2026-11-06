@@ -120,6 +120,10 @@ impl Connection {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Log {
+    /// Lines in the file that aren't blank.
+    pub lines: usize,
+    /// Lines from the game's networking code.
+    pub relay_lines: usize,
     pub first: Option<String>,
     pub last: Option<String>,
     pub condebug: bool,
@@ -558,6 +562,9 @@ pub fn parse(text: &str) -> Log {
     let mut pending_match = None;
     let mut reader = None;
     for line in text.lines() {
+        if !line.trim().is_empty() {
+            log.lines += 1;
+        }
         let (stamp, rest) = timed(line);
         let Some(stamp) = stamp else {
             continue;
@@ -567,6 +574,7 @@ pub fn parse(text: &str) -> Log {
         }
         log.last = Some(stamp.to_string());
         if let Some(text) = rest.strip_prefix("[SteamNetSockets] ") {
+            log.relay_lines += 1;
             log.steam_net(stamp, text, &mut pending_match);
         } else if let Some(text) = rest.strip_prefix("[Networking]") {
             log.networking(text, &mut reader);
@@ -660,15 +668,29 @@ impl LiveRoute {
     }
 }
 
+/// The value on a `"key"  "value"` line of a Steam text file.
+fn steam_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let mut parts = line.split('"').filter(|part| !part.trim().is_empty());
+    (parts.next()? == key).then_some(())?;
+    parts.next()
+}
+
 /// The folders in a Steam `libraryfolders.vdf`.
 pub fn libraries(vdf: &str) -> Vec<String> {
     vdf.lines()
-        .filter_map(|line| {
-            let mut parts = line.split('"').filter(|part| !part.trim().is_empty());
-            (parts.next()? == "path").then_some(())?;
-            Some(parts.next()?.replace("\\\\", "\\"))
-        })
+        .filter_map(|line| steam_value(line, "path"))
+        .map(|path| path.replace("\\\\", "\\"))
         .collect()
+}
+
+/// The folder under `steamapps\common` that a Steam app manifest names. Anything that could point
+/// elsewhere is ignored.
+pub fn install_folder(manifest: &str) -> Option<String> {
+    manifest
+        .lines()
+        .find_map(|line| steam_value(line, "installdir"))
+        .filter(|folder| !folder.contains(['\\', '/']) && !folder.contains(".."))
+        .map(str::to_string)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -785,8 +807,14 @@ fn pick_findings(log: &Log, context: &Context, found: &mut Vec<Finding>) {
                 Level::Check,
                 format!(
                     "Primary relay {} is not on your pick, {}. Check that this log is from after \
-                     your pick and that ExitLag routes to the same server.",
-                    primary.relay, context.pick
+                     your pick{}.",
+                    primary.relay,
+                    context.pick,
+                    if context.exitlag {
+                        " and that ExitLag routes to the same server"
+                    } else {
+                        ""
+                    }
                 ),
             ));
         }
@@ -816,10 +844,18 @@ fn pick_findings(log: &Log, context: &Context, found: &mut Vec<Finding>) {
         ));
     }
     if let (Some(primary), Some(direct)) = (conn.primary(), context.direct_ms)
-        && context.exitlag
         && primary.site() == context.pick
     {
-        if primary.ping > direct + SLOWER_LIMIT_MS {
+        if !context.exitlag {
+            found.push(finding(
+                Level::Note,
+                format!(
+                    "The game logged {} ms and direct ping reads {direct} ms now. They weren't \
+                     measured at the same moment.",
+                    primary.ping
+                ),
+            ));
+        } else if primary.ping > direct + SLOWER_LIMIT_MS {
             found.push(finding(
                 Level::Check,
                 format!(
@@ -889,7 +925,23 @@ pub fn findings(log: &Log, context: &Context) -> Vec<Finding> {
     let mut found = Vec::new();
     pick_findings(log, context, &mut found);
     quality_findings(log, &mut found);
-    if log.connections.is_empty() {
+    if log.first.is_none() && log.lines > 0 {
+        found.push(finding(
+            Level::Note,
+            format!(
+                "None of this file's {} lines are in the format dl-rs expects. It may be a \
+                 different kind of log, or from a language or version that hasn't been tested.",
+                log.lines
+            ),
+        ));
+    } else if log.relay_lines == 0 {
+        found.push(finding(
+            Level::Note,
+            "This log has no relay lines. Check that it's the game's console.log, and that the \
+             launch options in F1 are set."
+                .to_string(),
+        ));
+    } else if log.connections.is_empty() {
         found.push(finding(
             Level::Note,
             "No SDR connection in this log, only local ones. It doesn't test the route. Join a \
@@ -1498,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn route_comparison_only_applies_with_exitlag_on_the_pick() {
+    fn route_comparison_only_judges_a_route_with_exitlag_on_the_pick() {
         let boosted = Context {
             exitlag: true,
             direct_ms: Some(356),
@@ -1519,7 +1571,49 @@ mod tests {
             ..slower
         };
         let found = findings(&parse(SESSION), &plain);
-        assert!(levels_with(&found, "direct ping reads").is_empty());
+        assert_eq!(levels_with(&found, "direct ping reads 50"), [Level::Note]);
+        assert!(levels_with(&found, "slower than direct").is_empty());
+        assert!(levels_with(&found, "ExitLag").is_empty());
+    }
+
+    #[test]
+    fn with_no_exitlag_nothing_mentions_it() {
+        for pick in ["sgp", "fra", ""] {
+            let context = Context {
+                direct_ms: Some(50),
+                ..context(pick)
+            };
+            let text = report(&parse(SESSION), &context).join("\n");
+            assert!(!text.contains("ExitLag"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_file_in_an_unknown_format_says_so() {
+        let found = findings(&parse("Lundi 5 novembre\nautre chose\n"), &context("sgp"));
+        assert_eq!(
+            levels_with(&found, "None of this file's 2 lines"),
+            [Level::Note]
+        );
+        assert!(levels_with(&found, "No SDR connection").is_empty());
+    }
+
+    #[test]
+    fn a_log_with_no_relay_lines_says_so() {
+        let found = findings(
+            &parse("11/05 18:46:09 [RenderSystem] started\n"),
+            &context("sgp"),
+        );
+        assert_eq!(levels_with(&found, "no relay lines"), [Level::Note]);
+    }
+
+    #[test]
+    fn reads_the_install_folder_from_a_manifest() {
+        let manifest =
+            "\"AppState\"\n{\n\t\"appid\"\t\t\"1422450\"\n\t\"installdir\"\t\t\"Project 8\"\n}";
+        assert_eq!(install_folder(manifest).as_deref(), Some("Project 8"));
+        assert_eq!(install_folder("nothing"), None);
+        assert_eq!(install_folder("\"installdir\" \"..\\..\\evil\""), None);
     }
 
     #[test]

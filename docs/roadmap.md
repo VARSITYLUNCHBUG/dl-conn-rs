@@ -5,5 +5,4 @@ command, and windows only send command lines and display the result.
 
 ## Likely additions
 
-- Label console latency as direct pings.
 - Fix the `scripts/load-sim.ps1` cleanup bug and collect the filter latency comparison.
