@@ -22,11 +22,11 @@ fn resource_script(icon: &str) -> String {
          FILESUBTYPE VFT2_UNKNOWN\nBEGIN\nBLOCK \"StringFileInfo\"\nBEGIN\nBLOCK \"040904B0\"\nBEGIN\n",
     );
     for (name, value) in [
-        ("FileDescription", "dl-rs Steam relay picker"),
+        ("FileDescription", "dl-conn-rs Steam relay picker"),
         ("FileVersion", version.as_str()),
-        ("InternalName", "dl-rs"),
-        ("OriginalFilename", "dl-rs.exe"),
-        ("ProductName", "dl-rs"),
+        ("InternalName", "dl-conn-rs"),
+        ("OriginalFilename", "dl-conn-rs.exe"),
+        ("ProductName", "dl-conn-rs"),
         ("ProductVersion", version.as_str()),
     ] {
         let _ = writeln!(script, "VALUE \"{name}\", \"{value}\"");
@@ -41,15 +41,15 @@ fn main() {
     let dir = var("CARGO_MANIFEST_DIR").unwrap();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=app.manifest");
-    println!("cargo:rerun-if-changed=assets/dl-rs.ico");
+    println!("cargo:rerun-if-changed=assets/dl-conn-rs.ico");
     println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
     println!("cargo:rustc-link-arg-bins=/MANIFESTUAC:level='requireAdministrator'");
     println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{dir}/app.manifest");
     println!("cargo:rustc-link-arg-bins=/SUBSYSTEM:WINDOWS,10.0");
     println!("cargo:rustc-link-arg-bins=/OSVERSION:10.0");
 
-    let script = Path::new(&var("OUT_DIR").unwrap()).join("dl-rs.rc");
-    let icon = Path::new(&dir).join("assets").join("dl-rs.ico");
+    let script = Path::new(&var("OUT_DIR").unwrap()).join("dl-conn-rs.rc");
+    let icon = Path::new(&dir).join("assets").join("dl-conn-rs.ico");
     fs::write(&script, resource_script(&icon.display().to_string())).unwrap();
     embed_resource::compile(&script, embed_resource::NONE)
         .manifest_optional()

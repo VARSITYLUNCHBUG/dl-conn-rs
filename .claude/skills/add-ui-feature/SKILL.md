@@ -1,9 +1,9 @@
 ---
 name: add-ui-feature
-description: Add or change a dl-rs page, control or hotkey (dropdown, counters, F1/F2/F3 pages, console) as a thin egui wrapper over commands. Use for any dl-rs UI work.
+description: Add or change a dl-conn-rs page, control or hotkey (dropdown, counters, F1/F2/F3 pages, console) as a thin egui wrapper over commands. Use for any dl-conn-rs UI work.
 ---
 
-# Add a dl-rs UI feature
+# Add a dl-conn-rs UI feature
 
 The UI holds no logic. It sends command lines and displays what comes back.
 

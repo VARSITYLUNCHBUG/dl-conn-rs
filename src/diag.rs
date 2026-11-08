@@ -42,7 +42,7 @@ const WATCHED: [&str; 8] = [
     "steam.exe",
     "exitlag.exe",
 ];
-/// Games whose relay traffic dl-rs affects. A running one means a match may be live.
+/// Games whose relay traffic dl-conn-rs affects. A running one means a match may be live.
 const GAMES: [&str; 6] = [
     "deadlock.exe",
     "project8.exe",
@@ -56,15 +56,15 @@ const DEADLOCK_APP: &str = "1422450";
 const DEADLOCK_FOLDER: &str = "Deadlock";
 const LOG_IN_GAME: &str = r"game\citadel\console.log";
 /// Lets tests keep their settings and logs away from the real ones.
-const DATA_DIR_OVERRIDE: &str = "DL_RS_DATA_DIR";
-const APP_FOLDER: &str = "dl-rs";
+const DATA_DIR_OVERRIDE: &str = "DL_CONN_RS_DATA_DIR";
+const APP_FOLDER: &str = "dl-conn-rs";
 /// The end of the log holds the current session, and this keeps a forgotten log from stalling
 /// commands while it's read.
 const MAX_LOG_BYTES: u64 = 16 << 20;
 const PING_TIMEOUT_MS: u32 = 800;
 const IP_REQ_TIMED_OUT: u32 = 11010;
 /// Same size as ping.exe's default payload.
-const PROBE: &[u8; 32] = b"dl-rs relay latency probe 32 byt";
+const PROBE: &[u8; 32] = b"dl-conn-rs latency probe 32 byte";
 
 /// A filter on this PC refused the packet. On a picked relay that means another tool's rule.
 pub const IP_GENERAL_FAILURE: u32 = 11050;

@@ -160,7 +160,7 @@ impl Engine {
     }
 
     fn add_sublayer(&self, stamp: &str) -> Result<(), String> {
-        let (mut name, mut description) = (wide("dl-rs"), wide(stamp));
+        let (mut name, mut description) = (wide("dl-conn-rs"), wide(stamp));
         unsafe {
             let mut sublayer: FWPM_SUBLAYER0 = zeroed();
             sublayer.subLayerKey = SUBLAYER;
@@ -177,7 +177,7 @@ impl Engine {
     /// One filter per PoP. WFP ORs conditions on the same field, so this matches any of its
     /// relays. Hard block: clearing the action right stops lower-weight filters overriding it.
     fn add_filter(&self, pop: &str, ips: &[Ipv4Addr]) -> Result<(), String> {
-        let mut name = wide(&format!("dl-rs block {pop}"));
+        let mut name = wide(&format!("dl-conn-rs block {pop}"));
         unsafe {
             let mut conditions: Vec<FWPM_FILTER_CONDITION0> = ips
                 .iter()

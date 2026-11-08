@@ -1,15 +1,15 @@
 ---
 name: verify-live
-description: Verify dl-rs against real filters, real relays, the real console or a live game. Use after changes to blocking, routing or the UI, or when asked whether blocks and ExitLag routing are working.
+description: Verify dl-conn-rs against real filters, real relays, the real console or a live game. Use after changes to blocking, routing or the UI, or when asked whether blocks and ExitLag routing are working.
 ---
 
-# Verify dl-rs live
+# Verify dl-conn-rs live
 
 Pick the lightest check that answers the question. Check first whether Deadlock is running, because
 that decides what's safe:
 
 ```
-tasklist | grep -i -E "deadlock|dl-rs|exitlag"
+tasklist | grep -i -E "deadlock|dl-conn-rs|exitlag"
 ```
 
 | Question | Check | Admin? | Safe in a match? |
@@ -34,7 +34,7 @@ fix script bugs before asking again. Run it in the background and read its `resu
 Start-Process powershell.exe -Verb RunAs -PassThru -WindowStyle Minimized -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','"<script>"', ...)
 ```
 
-Pass absolute paths. Get the test exe from `cargo test --no-run` and use the `dl_rs-*.exe` path it
+Pass absolute paths. Get the test exe from `cargo test --no-run` and use the `dl_conn_rs-*.exe` path it
 prints. If UAC is declined, stop and ask rather than retrying.
 
 ## Reading the evidence
@@ -56,4 +56,4 @@ Expected with ExitLag and a strict pick: 0 packets directly to relays, traffic t
 - Keep a passing check apart from what it proves. A running process doesn't prove a connected game;
   ask the user.
 - Leave the user's setup as you found it. Say if a block is still on, and how to undo it.
-- Never stop or close the user's game, ExitLag or running dl-rs without asking.
+- Never stop or close the user's game, ExitLag or running dl-conn-rs without asking.

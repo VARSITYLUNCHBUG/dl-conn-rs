@@ -1,5 +1,5 @@
 #![windows_subsystem = "windows"]
 
 fn main() {
-    dl_rs::ui::run();
+    dl_conn_rs::ui::run();
 }

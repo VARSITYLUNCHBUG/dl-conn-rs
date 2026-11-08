@@ -7,10 +7,10 @@ down what you ran it on.
 
 - [ ] `scripts/check.ps1` passes.
 - [ ] `scripts/release.ps1` builds, and reports no machine paths.
-- [ ] `dist\dl-rs.exe` shows the right version and icon under Properties.
+- [ ] `dist\dl-conn-rs.exe` shows the right version and icon under Properties.
 - [ ] Signed, or you've accepted that users will see "Unknown publisher" and SmartScreen warnings.
-- [ ] `dist\THIRD_PARTY_NOTICES.txt` ships with it.
-- [ ] The repo has a licence that you've chosen.
+- [ ] `dist` holds `THIRD_PARTY_NOTICES.txt`, `LICENSE.txt`, the `.md5` and `.sha256` files and the
+      source zip, and all of them are attached to the GitHub release.
 
 ## Windows versions
 
@@ -33,7 +33,7 @@ is gone.
 - [ ] A standard user elevating with an administrator's password. Settings then belong to that
       administrator, and Steam should still be found.
 - [ ] No usable GPU: a VM with no 3D, or Remote Desktop. The software renderer should take over, which
-      `dl-rs.log` shows on its `renderer:` line. `DL_RS_RENDERER=software` forces it for a quick check.
+      `dl-conn-rs.log` shows on its `renderer:` line. `DL_CONN_RS_RENDERER=software` forces it for a quick check.
 - [ ] 100%, 150% and 200% display scaling, and a window moved between monitors.
 - [ ] Light and dark mode, with the theme set to `system`, changed while the app is open.
 

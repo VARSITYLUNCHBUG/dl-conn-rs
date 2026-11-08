@@ -1,4 +1,4 @@
-//! dl-rs: pick one Steam relay region and block the rest, for this boot only.
+//! dl-conn-rs: pick one Steam relay region and block the rest, for this boot only.
 //!
 //! Commands are the only way to act on the app. The dropdown and the console are both thin
 //! front-ends that send command lines to the session.

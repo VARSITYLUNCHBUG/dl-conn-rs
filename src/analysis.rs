@@ -929,7 +929,7 @@ pub fn findings(log: &Log, context: &Context) -> Vec<Finding> {
         found.push(finding(
             Level::Note,
             format!(
-                "None of this file's {} lines are in the format dl-rs expects. It may be a \
+                "None of this file's {} lines are in the format dl-conn-rs expects. It may be a \
                  different kind of log, or from a language or version that hasn't been tested.",
                 log.lines
             ),
@@ -1166,7 +1166,7 @@ fn table_section(log: &Log, context: &Context, lines: &mut Vec<String>) {
         ));
     }
     if !open.is_empty() {
-        lines.push("  * open in dl-rs now".to_string());
+        lines.push("  * open in dl-conn-rs now".to_string());
     }
 }
 
@@ -1287,7 +1287,7 @@ fn connection_section(log: &Log, lines: &mut Vec<String>) {
 
 /// The whole report, as lines.
 pub fn report(log: &Log, context: &Context) -> Vec<String> {
-    let mut lines = vec!["dl-rs log report".to_string()];
+    let mut lines = vec!["dl-conn-rs log report".to_string()];
     file_section(log, context, &mut lines);
     findings_section(log, context, &mut lines);
     config_section(log, &mut lines);

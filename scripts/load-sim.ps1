@@ -1,7 +1,7 @@
-# Runs game-shaped traffic through dl-rs and counts what really reaches the network card with the
-# built-in pktmon, so the result doesn't depend on dl-rs's own reports. Run from an admin shell:
+# Runs game-shaped traffic through dl-conn-rs and counts what really reaches the network card with the
+# built-in pktmon, so the result doesn't depend on dl-conn-rs's own reports. Run from an admin shell:
 #   cargo build --release --example loadsim; cargo build --release
-#   powershell -ExecutionPolicy Bypass -File scripts\load-sim.ps1 -SimExe <target\release\examples\loadsim.exe> -AppExe <target\release\dl-rs.exe> -TestExe <target\debug\deps\dl_rs-*.exe> -OutDir <dir>
+#   powershell -ExecutionPolicy Bypass -File scripts\load-sim.ps1 -SimExe <target\release\examples\loadsim.exe> -AppExe <target\release\dl-conn-rs.exe> -TestExe <target\debug\deps\dl_conn_rs-*.exe> -OutDir <dir>
 # To test ExitLag with a real game, boost and run it first, stay out of a match, then add
 #   -Scenario game -ExeName deadlock.exe -Pick sgp
 # That scenario only ever picks the server ExitLag is routing to, so it can't cut the game off.
@@ -23,7 +23,7 @@ $OutDir = (Resolve-Path $OutDir).Path
 # Settings and the log stay in the output folder, away from the real ones.
 $data = Join-Path $OutDir 'data'
 New-Item -ItemType Directory -Force $data | Out-Null
-$env:DL_RS_DATA_DIR = $data
+$env:DL_CONN_RS_DATA_DIR = $data
 $log = Join-Path $OutDir 'results.txt'
 Set-Content $log "started $(Get-Date), process $ExeName, $Pps pps x $Size bytes"
 function Note($text) { Add-Content $log $text }
@@ -132,8 +132,8 @@ function NoteWire($label, $counts, $config, $pickCode) {
     Note "$label busiest other destinations: $(($others | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', ')"
 }
 
-# Applies the block during a real match and measures its effect and dl-rs's own cost. Sends no test
-# traffic, posts its input so it can't take focus, and leaves dl-rs running with the block on.
+# Applies the block during a real match and measures its effect and dl-conn-rs's own cost. Sends no test
+# traffic, posts its input so it can't take focus, and leaves dl-conn-rs running with the block on.
 function ProbeScenario($config) {
     $pickRelay = $config.pops.$Pick
     Note "--- 1. the match with no block, 15 s"
@@ -156,8 +156,8 @@ function ProbeScenario($config) {
     NoteWire 'during' (CaptureStop 'probe-block') $config $Pick
     $proc.Refresh()
     $cpu = ($proc.TotalProcessorTime - $cpuBefore).TotalMilliseconds
-    Note ("dl-rs over 60 s: cpu {0:N0} ms, working set {1:N1} MB, private {2:N1} MB, threads {3}, handles {4}" -f $cpu, ($proc.WorkingSet64 / 1MB), ($proc.PrivateMemorySize64 / 1MB), $proc.Threads.Count, $proc.HandleCount)
-    Note "dl-rs left running with $Pick picked"
+    Note ("dl-conn-rs over 60 s: cpu {0:N0} ms, working set {1:N1} MB, private {2:N1} MB, threads {3}, handles {4}" -f $cpu, ($proc.WorkingSet64 / 1MB), ($proc.PrivateMemorySize64 / 1MB), $proc.Threads.Count, $proc.HandleCount)
+    Note "dl-conn-rs left running with $Pick picked"
 }
 
 function GameScenario($config) {
@@ -308,7 +308,7 @@ finally {
     Get-ChildItem $OutDir -Filter *.etl -ErrorAction SilentlyContinue | Remove-Item -ErrorAction SilentlyContinue
     # The probe deliberately leaves the block in place.
     if ($Scenario -eq 'probe') { Note 'finished'; exit }
-    Get-Process dl-rs -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process dl-conn-rs -ErrorAction SilentlyContinue | Stop-Process -Force
     # Matches on the full path, so a real game with the same process name is never touched.
     Get-Process ([IO.Path]::GetFileNameWithoutExtension($ExeName)) -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $sim } | Stop-Process -Force
     $p = Start-Process $TestExe -ArgumentList 'live_tests::clear_any_block --ignored --exact' -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $OutDir 'clear.txt')
@@ -316,7 +316,7 @@ finally {
     Push-Location $OutDir
     & netsh wfp show state file=state-final.xml | Out-Null
     Pop-Location
-    Note ("dl-rs filters left behind: {0}" -f (Select-String -Path (Join-Path $OutDir 'state-final.xml') -SimpleMatch 'dl-rs' -Quiet))
+    Note ("dl-conn-rs filters left behind: {0}" -f (Select-String -Path (Join-Path $OutDir 'state-final.xml') -SimpleMatch 'dl-conn-rs' -Quiet))
     Remove-Item (Join-Path $OutDir 'state-final.xml') -ErrorAction SilentlyContinue
     Note "finished"
 }

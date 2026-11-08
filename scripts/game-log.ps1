@@ -37,7 +37,7 @@ if (-not $Path) { $Path = Find-Log }
 $item = Get-Item $Path
 "file: $Path"
 "size: {0:N0} KB, last write {1}" -f ($item.Length / 1KB), $item.LastWriteTime
-foreach ($name in 'deadlock', 'project8', 'ExitLag', 'dl-rs') {
+foreach ($name in 'deadlock', 'project8', 'ExitLag', 'dl-conn-rs') {
     foreach ($p in Get-Process $name -ErrorAction SilentlyContinue) { "running: $($p.ProcessName)#$($p.Id)" }
 }
 

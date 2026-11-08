@@ -1,4 +1,4 @@
-# dl-rs
+# dl-conn-rs
 
 Picks one Steam relay site and blocks the rest until reboot, with or without ExitLag. Rust, egui, one
 admin exe for Windows 10 and 11, and Server 2016 and later, x64. See `README.md` for what it does,
@@ -14,13 +14,17 @@ admin exe for Windows 10 and 11, and Server 2016 and later, x64. See `README.md`
   exists. Find folders through the registry and known folders. `scripts/release.ps1` fails if the exe
   holds a machine path. Numbers measured here don't belong in user text.
 - **UI text:** plain ASCII. No emoji or em dashes. `scripts/check.ps1` enforces this across `src/`.
+- **Docs:** user docs are `README.md` and the wiki pages in `docs/wiki`, held to the same plain ASCII.
+  Keep them in step with behaviour. `scripts/publish-wiki.ps1` pushes `docs/wiki` to the GitHub wiki.
 - **State:** the active pick lives in WFP, not in memory or on disk. It's recovered from the stamp.
-  Only settings and a capped log go to disk, in the local app data folder under `dl-rs`.
+  Only settings and a capped log go to disk, in the local app data folder under `dl-conn-rs`.
 - **Failure:** bad data or a failed fetch never lifts a block or shrinks the relay set.
 - **Overhead:** no per-packet work, and diagnostics only while requested. The one exception is the
   counters: one ping per `ping_every` while there's a pick, and a process check and log size check
   every 5 s. The window draws only on input or a change, so nothing may request a repaint every frame.
-- **Git:** local only, no remote. Commit only when asked. This machine has no git identity, so pass
+- **Git:** `origin` is github.com/VARSITYLUNCHBUG/dl-conn-rs. Commit only when asked.
+  `.claude/hooks/guard-commands.js` blocks pushes from Claude sessions, so the user pushes by hand.
+  This machine has no git identity, so pass
   `-c user.name=VARSITYLUNCHBUG -c user.email=100867870+VARSITYLUNCHBUG@users.noreply.github.com`.
 - **No Claude signature in any commit**, in the message or the identity. Never use `--no-verify` to
   get past this. The `.githooks/commit-msg` hook enforces it, and `scripts/check.ps1` scans all
@@ -33,7 +37,7 @@ admin exe for Windows 10 and 11, and Server 2016 and later, x64. See `README.md`
 window --- command lines --> command.rs parses --> session.rs --> wfp / sdr / diag / analysis
   ^                                                  |   ^
   +------- "changed", then it queries again ---------+   +-- counters <-- monitor.rs thread
-                                                     +--> log.rs --> console page, dl-rs.log
+                                                     +--> log.rs --> console page, dl-conn-rs.log
 ```
 
 | File | Purpose |
@@ -78,7 +82,7 @@ powershell -ExecutionPolicy Bypass -File scripts/game-log.ps1
 ```
 
 `check.ps1` runs format, ASCII, the commit rule, clippy, unit and UI tests, and a release build that
-fails on any machine path. It builds to `target/dist`, so a running dl-rs elsewhere can't lock it.
+fails on any machine path. It builds to `target/dist`, so a running dl-conn-rs elsewhere can't lock it.
 
 `scripts/window-check.ps1` opens the real window with a fake firewall and measures start time and idle
 cost on both renderers. It needs no admin rights and can't change a block, so it's safe with a game
@@ -90,7 +94,7 @@ running. `scripts/live-test.ps1` uses real filters and needs a UAC prompt.
 - `ALE_AUTH_CONNECT_V4` blocks new and live UDP flows. `ALE_CONNECT_REDIRECT_V4` accepts a block
   filter and then ignores it, measured with a real DNS round trip. Don't use it.
 - WFP filters without the persistent flag are the "until reboot" mechanism. `netsh wfp show
-  sublayers` isn't a real command; use `netsh wfp show state file=...` and search for `dl-rs`.
+  sublayers` isn't a real command; use `netsh wfp show state file=...` and search for `dl-conn-rs`.
 - Blocking removes the game's backup relay. Live evidence: `Lost backup #1 maa2#102`, 27 s after
   the block. Strict blocking leaves one relay with no failover, which is why `--backup` exists.
 
@@ -98,8 +102,8 @@ running. `scripts/live-test.ps1` uses real filters and needs a UAC prompt.
 - It tunnels boosted traffic through nodes, so no packets reach relays directly. Its `nfextlag`
   driver matched a process by name alone in testing. Blocks still catch that process's traffic to
   blocked relays before the tunnel.
-- dl-rs's own ICMP isn't boosted. Example from one PC: direct 356 ms against 136 ms in game. Never
-  describe a dl-rs ping as the game's latency. Only the game's log shows the route ping, and only
+- dl-conn-rs's own ICMP isn't boosted. Example from one PC: direct 356 ms against 136 ms in game. Never
+  describe a dl-conn-rs ping as the game's latency. Only the game's log shows the route ping, and only
   when it measures or connects, so a route figure can't be a true live counter.
 
 **Testing**
@@ -127,7 +131,7 @@ running. `scripts/live-test.ps1` uses real filters and needs a UAC prompt.
 - A popup can't extend past its window, which is why there's no compact window.
 - While the window is minimized or fully covered, eframe runs no UI pass and drops input, so anything
   that must keep working goes in `App::background`, called from `eframe::App::logic`. Scripts set
-  `DL_RS_DRAW_HIDDEN` so a covered window still takes their input.
+  `DL_CONN_RS_DRAW_HIDDEN` so a covered window still takes their input.
 - The release build measured 135 MB working set on an NVIDIA driver, against about 5 MB for the old
   Win32 UI, and 7 MB on disk against 590 KB. Much of it is likely the driver. `MemoryHints::MemoryUsage`
   is already set.
@@ -157,9 +161,8 @@ running. `scripts/live-test.ps1` uses real filters and needs a UAC prompt.
 - In a match under a strict Singapore block, the game ran 7 minutes with no backup, then logged
   `Selecting tyo#172 as backup #1` at 18:53:54, 8 s before the player left. Most likely the block
   had just been cleared, which would mean the game picks up a backup mid-connection. Unconfirmed:
-  also rule out a leak by repeating it with the block held. `dl-rs.log` now records when picks change.
+  also rule out a leak by repeating it with the block held. `dl-conn-rs.log` now records when picks change.
 - `scripts/load-sim.ps1` final cleanup stops early in the `load` and `game` scenarios. Cause unknown.
   The script was rewritten for egui and hasn't been run since.
-- The repo has no licence file. Distributing it should have one.
 - Untested: Windows 11, older Windows 10, a no-GPU machine, real reboot, sleep and resume, offline at startup, filters restoring themselves,
   whether a pick steers matchmaking, a pick different from ExitLag's server.

@@ -1,7 +1,8 @@
-# Builds the exe to give to other people. Build paths are removed from it, its licence notices are
-# written beside it, and it's signed if a certificate is set up. Nothing is uploaded.
+# Builds the release files to give to other people: the exe with build paths removed, its MD5 and
+# SHA-256 hashes, the licence and crate notices, and a source zip of the committed tree. The exe is
+# signed if a certificate is set up. Nothing is uploaded.
 #   powershell -ExecutionPolicy Bypass -File scripts\release.ps1 [-OutDir dist]
-# To sign, set DL_RS_SIGN_THUMBPRINT to a certificate's thumbprint in your Windows certificate store.
+# To sign, set DL_CONN_RS_SIGN_THUMBPRINT to a certificate's thumbprint in your Windows certificate store.
 # Never put a key or password in this repo.
 param(
     [string]$OutDir = 'dist',
@@ -22,11 +23,11 @@ $env:RUSTFLAGS = @(
     "--remap-path-prefix=$env:USERPROFILE=user",
     "--remap-path-prefix=$rustupHome=rustup",
     "--remap-path-prefix=$cargoHome\registry\src=crates",
-    "--remap-path-prefix=$root=dl-rs"
+    "--remap-path-prefix=$root=dl-conn-rs"
 ) -join ' '
 cargo build --release --locked --target-dir target\dist
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-$exe = Join-Path $root 'target\dist\release\dl-rs.exe'
+$exe = Join-Path $root 'target\dist\release\dl-conn-rs.exe'
 
 # Anything that identifies this PC or its user mustn't be in something given to others.
 $text = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($exe))
@@ -39,7 +40,7 @@ Write-Output ("{0}: {1:N1} MB, no machine paths" -f $exe, ((Get-Item $exe).Lengt
 if ($BuildOnly) { exit 0 }
 
 New-Item -ItemType Directory -Force $OutDir | Out-Null
-$out = Join-Path $OutDir 'dl-rs.exe'
+$out = Join-Path $OutDir 'dl-conn-rs.exe'
 Copy-Item $exe $out -Force
 
 # Every crate in the exe and its licence, as their licences require.
@@ -56,21 +57,31 @@ while ($pending.Count) {
         if ($dependency.dep_kinds | Where-Object { -not $_.kind }) { $pending.Enqueue($dependency.pkg) }
     }
 }
-$notices = @('dl-rs uses these open source crates, under these licences:', '')
-$metadata.packages | Where-Object { $normal[$_.id] -and $_.name -ne 'dl-rs' } | Sort-Object name, version | ForEach-Object {
+$notices = @('dl-conn-rs uses these open source crates, under these licences:', '')
+$metadata.packages | Where-Object { $normal[$_.id] -and $_.name -ne 'dl-conn-rs' } | Sort-Object name, version | ForEach-Object {
     $notices += "$($_.name) $($_.version): $($_.license)"
 }
 Set-Content (Join-Path $OutDir 'THIRD_PARTY_NOTICES.txt') $notices -Encoding ASCII
 
-if ($env:DL_RS_SIGN_THUMBPRINT) {
+if ($env:DL_CONN_RS_SIGN_THUMBPRINT) {
     $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
     if (-not $signtool) { throw 'signtool.exe not found. Install the Windows SDK.' }
-    & $signtool.FullName sign /sha1 $env:DL_RS_SIGN_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $out
+    & $signtool.FullName sign /sha1 $env:DL_CONN_RS_SIGN_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $out
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Write-Output 'Signed.'
 } else {
-    Write-Output 'Not signed: DL_RS_SIGN_THUMBPRINT is not set, so users will see "Unknown publisher".'
+    Write-Output 'Not signed: DL_CONN_RS_SIGN_THUMBPRINT is not set, so users will see "Unknown publisher".'
 }
-$hash = (Get-FileHash $out -Algorithm SHA256).Hash
-Set-Content (Join-Path $OutDir 'dl-rs.exe.sha256') "$hash  dl-rs.exe" -Encoding ASCII
-Write-Output "SHA-256: $hash"
+foreach ($algorithm in 'MD5', 'SHA256') {
+    $hash = (Get-FileHash $out -Algorithm $algorithm).Hash.ToLower()
+    Set-Content (Join-Path $OutDir "dl-conn-rs.exe.$($algorithm.ToLower())") "$hash  dl-conn-rs.exe" -Encoding ASCII
+    Write-Output "${algorithm}: $hash"
+}
+
+Copy-Item (Join-Path $root 'LICENSE') (Join-Path $OutDir 'LICENSE.txt') -Force
+$version = ($metadata.packages | Where-Object { $_.name -eq 'dl-conn-rs' }).version
+if (git status --porcelain) { Write-Output 'Note: uncommitted changes are not in the source zip.' }
+$source = Join-Path $OutDir "dl-conn-rs-$version-source.zip"
+git archive --format=zip --prefix="dl-conn-rs-$version/" -o $source HEAD
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Output "Source: $source"

@@ -18,7 +18,7 @@ public static class W {
   delegate bool EnumProc(IntPtr h,IntPtr l);
   [DllImport("user32")] static extern bool EnumWindows(EnumProc f,IntPtr l);
   [DllImport("user32")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
-  public static IntPtr TitledWindow(int pid){IntPtr found=IntPtr.Zero;EnumWindows((h,l)=>{uint p;GetWindowThreadProcessId(h,out p);if(p==pid&&IsWindowVisible(h)&&Title(h).StartsWith("dl-rs")){found=h;return false;}return true;},IntPtr.Zero);return found;}
+  public static IntPtr TitledWindow(int pid){IntPtr found=IntPtr.Zero;EnumWindows((h,l)=>{uint p;GetWindowThreadProcessId(h,out p);if(p==pid&&IsWindowVisible(h)&&Title(h).StartsWith("dl-conn-rs")){found=h;return false;}return true;},IntPtr.Zero);return found;}
   [DllImport("user32")] static extern uint MapVirtualKey(uint code,uint map);
   public static void PostKey(IntPtr h,uint vk){uint scan=MapVirtualKey(vk,0);PostMessage(h,0x100,(IntPtr)vk,(IntPtr)(1|(scan<<16)));PostMessage(h,0x101,(IntPtr)vk,(IntPtr)(int)(1|(scan<<16)|0xC0000000));}
   public static int[] Rect(IntPtr h){RECT r;GetWindowRect(h,out r);return new[]{r.L,r.T,r.R,r.B};}

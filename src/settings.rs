@@ -40,7 +40,7 @@ const KEYS: &[Key] = &[
         title: "Direct ping interval (s)",
         kind: Kind::Number,
         allowed: "0 to 300",
-        about: "How often dl-rs pings the pick for the Direct counter. 0 stops all ping traffic.",
+        about: "How often dl-conn-rs pings the pick for the Direct counter. 0 stops all ping traffic.",
     },
     Key {
         name: "refresh_minutes",
@@ -48,7 +48,7 @@ const KEYS: &[Key] = &[
         kind: Kind::Number,
         allowed: "0, or 5 to 1440",
         about: "How often the relay list is fetched from Steam. 0 is manual, which also stops \
-                dl-rs repairing removed filters on its own.",
+                dl-conn-rs repairing removed filters on its own.",
     },
     Key {
         name: "hold_in_game",
@@ -78,7 +78,7 @@ const KEYS: &[Key] = &[
         title: "Remove block on exit",
         kind: Kind::Toggle,
         allowed: "on or off",
-        about: "Removes the block when dl-rs closes. Off leaves it on until reboot or the next pick.",
+        about: "Removes the block when dl-conn-rs closes. Off leaves it on until reboot or the next pick.",
     },
     Key {
         name: "theme",
@@ -268,7 +268,7 @@ impl Settings {
     }
 
     pub fn to_text(&self) -> String {
-        let mut text = String::from("; dl-rs settings. Change these in the app with F2.\r\n");
+        let mut text = String::from("; dl-conn-rs settings. Change these in the app with F2.\r\n");
         for key in KEYS {
             let _ = write!(text, "{}={}\r\n", key.name, self.value(key.name));
         }
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn load_and_save_round_trip_through_a_real_file() {
-        let folder = std::env::temp_dir().join(format!("dl-rs-test-{}", std::process::id()));
+        let folder = std::env::temp_dir().join(format!("dl-conn-rs-test-{}", std::process::id()));
         let path = folder.join("nested").join("settings.ini");
         let (missing, notes) = load(&path);
         assert_eq!(missing, Settings::default());

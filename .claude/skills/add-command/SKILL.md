@@ -1,9 +1,9 @@
 ---
 name: add-command
-description: Add or change a dl-rs verb-noun command, including its parsing, help, completion, session handling and tests. Use for any new behaviour, setting or diagnostic in dl-rs, because all behaviour goes through commands.
+description: Add or change a dl-conn-rs verb-noun command, including its parsing, help, completion, session handling and tests. Use for any new behaviour, setting or diagnostic in dl-conn-rs, because all behaviour goes through commands.
 ---
 
-# Add a dl-rs command
+# Add a dl-conn-rs command
 
 Commands are the only way to act on the app, so new behaviour starts here. One table drives parsing,
 help and completion.

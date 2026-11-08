@@ -159,8 +159,8 @@ mod tests {
 
     #[test]
     fn the_file_is_capped_and_keeps_one_old_copy() {
-        let folder = std::env::temp_dir().join(format!("dl-rs-log-{}", std::process::id()));
-        let path = folder.join("nested").join("dl-rs.log");
+        let folder = std::env::temp_dir().join(format!("dl-conn-rs-log-{}", std::process::id()));
+        let path = folder.join("nested").join("dl-conn-rs.log");
         let mut file = LogFile::open(path.clone()).unwrap();
         file.write("first\r\n");
         assert_eq!(fs::read_to_string(&path).unwrap(), "first\r\n");

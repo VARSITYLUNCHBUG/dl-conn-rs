@@ -1,17 +1,17 @@
 //! The text behind the F1 window and `show guide`. Only states what's been verified, and says so
 //! where something hasn't been.
 
-const GUIDE: &str = r"dl-rs help
+const GUIDE: &str = r"dl-conn-rs help
 
 Test your connection in a custom game before you trust it in a real match.
 Work through the steps in order.
 
 
-WHAT DL-RS DOES
+WHAT DL-CONN-RS DOES
 
-dl-rs blocks every Steam relay except the server you pick, until you pick again
-or restart the PC. It chooses which relays the game can reach. It does not make
-any route faster, and no setting lowers ping beyond choosing a route.
+dl-conn-rs blocks every Steam relay except the server you pick, until you pick
+again or restart the PC. It chooses which relays the game can reach. It does not
+make any route faster, and no setting lowers ping beyond choosing a route.
 
 A strict pick also removes the backup relay the game normally keeps. To keep a
 failover route, set a default backup in F2.
@@ -41,8 +41,8 @@ keep one. To read a different game's log, set its path in F2.
 STEP 2: PICK YOUR SERVER FIRST
 
   1. Close the game if it's running.
-  2. Choose your server in the dl-rs dropdown. Type to search by city, code or
-     region.
+  2. Choose your server in the dl-conn-rs dropdown. Type to search by city, code
+     or region.
   3. Start the game.
 
 Pick before the game starts, so the ping measurement it runs at startup already
@@ -127,10 +127,10 @@ Game
 
 IF YOU USE EXITLAG
 
-You don't need ExitLag to use dl-rs. If you do use it:
+You don't need ExitLag to use dl-conn-rs. If you do use it:
 
-  1. Choose the same server in ExitLag as in dl-rs. A block can't change where
-     ExitLag routes.
+  1. Choose the same server in ExitLag as in dl-conn-rs. A block can't change
+     where ExitLag routes.
   2. The second counter is labelled ExitLag route while ExitLag is running. A
      running ExitLag doesn't prove that the game was boosted at that moment.
   3. Direct doesn't go through ExitLag, so the two can differ a lot.

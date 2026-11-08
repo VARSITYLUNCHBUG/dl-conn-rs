@@ -1,4 +1,4 @@
-//! Game-shaped UDP traffic for testing dl-rs under load. Not part of the app.
+//! Game-shaped UDP traffic for testing dl-conn-rs under load. Not part of the app.
 //!
 //! Like a game client, it uses one socket: a steady tick stream to the relay it's playing through,
 //! plus small once-a-second pings to other relays, the way Steam's relay selection probes them.

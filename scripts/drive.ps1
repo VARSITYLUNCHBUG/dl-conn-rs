@@ -5,7 +5,7 @@
 # the app's log file and the same accessibility tree. Real mouse clicks are the one thing here that
 # moves the user's pointer.
 # A window that's minimized or covered runs no UI pass and drops its input, unless it's told otherwise.
-$env:DL_RS_DRAW_HIDDEN = '1'
+$env:DL_CONN_RS_DRAW_HIDDEN = '1'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -52,7 +52,7 @@ function SetText($hwnd, $name, $text, $settleMs = 150) {
 
 # Runs a command through the in-app console, which must already be open.
 function RunCommand($hwnd, $line, $settleMs = 400) {
-    SetText $hwnd 'dl-rs>' $line
+    SetText $hwnd 'dl-conn-rs>' $line
     Press $hwnd $VK_RETURN $settleMs
 }
 
@@ -67,7 +67,7 @@ function ToggleConsole($hwnd, $settleMs = 500) {
 
 # The app's log. It's held open for appending, so it's read with shared access.
 function LogLines($dataDir) {
-    $path = Join-Path $dataDir 'dl-rs.log'
+    $path = Join-Path $dataDir 'dl-conn-rs.log'
     if (-not (Test-Path $path)) { return @() }
     $stream = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite,Delete')
     $reader = New-Object IO.StreamReader($stream)
@@ -122,7 +122,7 @@ function UiNames($hwnd) {
 }
 
 function PromptText($hwnd) {
-    $element = UiFindEdit $hwnd 'dl-rs>'
+    $element = UiFindEdit $hwnd 'dl-conn-rs>'
     $value = $element.GetCurrentPropertyValue([Windows.Automation.ValuePattern]::ValueProperty)
     # An empty box reports no value at all rather than an empty string.
     if ($value -is [string]) { $value } else { '' }

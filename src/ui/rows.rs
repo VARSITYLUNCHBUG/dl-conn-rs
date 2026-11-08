@@ -135,14 +135,14 @@ pub fn build_view(servers: &[Server], status: &Status) -> View {
 
 pub fn title(status: &Status) -> String {
     if let Some(error) = &status.error {
-        return format!("dl-rs - {error}");
+        return format!("dl-conn-rs - {error}");
     }
     let offline = if status.offline { " (offline)" } else { "" };
     if status.pick.is_empty() {
         if !status.loaded && !status.offline {
-            return "dl-rs - loading".to_string();
+            return "dl-conn-rs - loading".to_string();
         }
-        return format!("dl-rs - no block{offline}");
+        return format!("dl-conn-rs - no block{offline}");
     }
     let backup = status
         .backup
@@ -150,10 +150,10 @@ pub fn title(status: &Status) -> String {
         .map_or(String::new(), |backup| format!(" + {backup}"));
     match &status.pick_desc {
         Some(desc) => format!(
-            "dl-rs - {desc}{backup} - {} blocked{offline}",
+            "dl-conn-rs - {desc}{backup} - {} blocked{offline}",
             status.blocked
         ),
-        None => format!("dl-rs - {} active{offline}", status.pick),
+        None => format!("dl-conn-rs - {} active{offline}", status.pick),
     }
 }
 
@@ -300,7 +300,7 @@ mod tests {
         );
         assert_eq!(
             view.title,
-            "dl-rs - Johannesburg (South Africa) - 216 blocked"
+            "dl-conn-rs - Johannesburg (South Africa) - 216 blocked"
         );
     }
 
@@ -328,7 +328,7 @@ mod tests {
         );
         assert_eq!(
             view.title,
-            "dl-rs - Amsterdam (Netherlands) + jnb - 200 blocked"
+            "dl-conn-rs - Amsterdam (Netherlands) + jnb - 200 blocked"
         );
     }
 
@@ -345,7 +345,7 @@ mod tests {
             view.rows[view.selected.unwrap()].code.as_deref(),
             Some("gone")
         );
-        assert_eq!(view.title, "dl-rs - gone active");
+        assert_eq!(view.title, "dl-conn-rs - gone active");
     }
 
     #[test]
@@ -368,27 +368,27 @@ mod tests {
 
     #[test]
     fn titles_cover_every_state() {
-        assert_eq!(title(&status()), "dl-rs - no block");
+        assert_eq!(title(&status()), "dl-conn-rs - no block");
         assert_eq!(
             title(&Status {
                 loaded: false,
                 ..status()
             }),
-            "dl-rs - loading"
+            "dl-conn-rs - loading"
         );
         assert_eq!(
             title(&Status {
                 offline: true,
                 ..status()
             }),
-            "dl-rs - no block (offline)"
+            "dl-conn-rs - no block (offline)"
         );
         assert_eq!(
             title(&Status {
                 error: Some("denied".to_string()),
                 ..status()
             }),
-            "dl-rs - denied"
+            "dl-conn-rs - denied"
         );
     }
 }

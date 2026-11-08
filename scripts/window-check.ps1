@@ -3,7 +3,7 @@
 # renderer and on the Windows software renderer, and drives it with posted keys and UI Automation. It
 # takes no focus and doesn't move the mouse, so a game keeps its input.
 #   cargo test --no-run
-#   powershell -ExecutionPolicy Bypass -File scripts\window-check.ps1 -TestExe <target\debug\deps\dl_rs-*.exe> -OutDir <dir>
+#   powershell -ExecutionPolicy Bypass -File scripts\window-check.ps1 -TestExe <target\debug\deps\dl_conn_rs-*.exe> -OutDir <dir>
 param(
     [Parameter(Mandatory)][string]$TestExe,
     [Parameter(Mandatory)][string]$OutDir
@@ -28,10 +28,10 @@ try {
         $data = Join-Path $OutDir "data-$renderer"
         Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force $data | Out-Null
-        $env:DL_RS_DATA_DIR = $data
-        $env:DL_RS_RENDERER = $(if ($renderer -eq 'software') { 'software' } else { '' })
+        $env:DL_CONN_RS_DATA_DIR = $data
+        $env:DL_CONN_RS_RENDERER = $(if ($renderer -eq 'software') { 'software' } else { '' })
         # The second round runs as a user would, with no help when hidden.
-        $env:DL_RS_DRAW_HIDDEN = $(if ($renderer -eq 'software') { '' } else { '1' })
+        $env:DL_CONN_RS_DRAW_HIDDEN = $(if ($renderer -eq 'software') { '' } else { '1' })
         $out = Join-Path $OutDir "app-$renderer.txt"
         $clock = [Diagnostics.Stopwatch]::StartNew()
         $app = Start-Process $TestExe -ArgumentList 'ui::adapter_tests::window_with_a_fake_firewall --ignored --exact --nocapture --test-threads=1' `
@@ -68,7 +68,7 @@ try {
             "title: $title"
             Check 'a posted command picks a server' ($title -match 'Sterling')
             Check 'the log has the command' ((LogCount $data '> set pick iad') -eq 1)
-            SetText $hwnd 'dl-rs>' 'list se'
+            SetText $hwnd 'dl-conn-rs>' 'list se'
             Press $hwnd $VK_ESCAPE 300
             Check 'a posted Esc clears the line' ((PromptText $hwnd) -eq '')
             $before = LogCount $data '> '

@@ -31,7 +31,7 @@ const TABS: [(Page, &str); 5] = [
     (Page::Console, "Console  `"),
 ];
 
-const DRAW_HIDDEN_OVERRIDE: &str = "DL_RS_DRAW_HIDDEN";
+const DRAW_HIDDEN_OVERRIDE: &str = "DL_CONN_RS_DRAW_HIDDEN";
 const THEMES: [(&str, &str); 3] = [("system", "System"), ("light", "Light"), ("dark", "Dark")];
 
 /// Everything the top of the window and the status page show, from one round of queries.

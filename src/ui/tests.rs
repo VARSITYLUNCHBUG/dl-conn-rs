@@ -301,7 +301,7 @@ fn open_console(harness: &mut Harness<'static, App>) {
 
 fn prompt_text(harness: &Harness<'static, App>) -> String {
     harness
-        .get_by_role_and_label(egui::accesskit::Role::TextInput, "dl-rs>")
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "dl-conn-rs>")
         .value()
         .unwrap_or_default()
 }
@@ -524,7 +524,7 @@ fn it_works_with_no_exitlag_no_steam_and_no_log() {
 }
 
 fn data_folder(name: &str) -> PathBuf {
-    let folder = std::env::temp_dir().join(format!("dl-rs-ui-{name}-{}", std::process::id()));
+    let folder = std::env::temp_dir().join(format!("dl-conn-rs-ui-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&folder).unwrap();
     folder
 }
@@ -532,9 +532,9 @@ fn data_folder(name: &str) -> PathBuf {
 /// Saves a picture of each page in both modes, for looking at by eye. It needs a GPU or the Windows
 /// software renderer, so it only runs when asked for.
 #[test]
-#[ignore = "writes screenshots; set DL_RS_SHOTS to a folder and run by hand"]
+#[ignore = "writes screenshots; set DL_CONN_RS_SHOTS to a folder and run by hand"]
 fn screenshots() {
-    let folder = PathBuf::from(std::env::var_os("DL_RS_SHOTS").expect("DL_RS_SHOTS"));
+    let folder = PathBuf::from(std::env::var_os("DL_CONN_RS_SHOTS").expect("DL_CONN_RS_SHOTS"));
     std::fs::create_dir_all(&folder).unwrap();
     for theme_name in ["light", "dark"] {
         let firewall = FakeFirewall::default();

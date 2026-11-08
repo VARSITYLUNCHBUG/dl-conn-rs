@@ -1370,7 +1370,7 @@ mod tests {
     #[test]
     fn analyze_log_reports_on_the_configured_file() {
         let (mut session, _, _, _wake) = session();
-        let path = std::env::temp_dir().join(format!("dl-rs-log-{}.log", std::process::id()));
+        let path = std::env::temp_dir().join(format!("dl-conn-rs-log-{}.log", std::process::id()));
         std::fs::write(
             &path,
             "11/05 18:46:43 [SteamNetSockets] [#1 SDR server vport 0] Selecting fra#1 (1.1.1.1:1) as primary.  (Ping = 40 = 39+1+0 (front+interior+remote).  Rank=1 Score=1)\n",

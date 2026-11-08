@@ -1,4 +1,4 @@
-// Draws the app icon and writes assets/dl-rs.ico (for the exe) and assets/icon-64.rgba (for the
+// Draws the app icon and writes assets/dl-conn-rs.ico (for the exe) and assets/icon-64.rgba (for the
 // window). Run from the repo root with node when the design changes. The results are checked in, so
 // a normal build doesn't need this.
 const fs = require('fs');
@@ -109,5 +109,5 @@ sizes.forEach((size, index) => {
 
 const assets = path.join(__dirname, '..', 'assets');
 fs.mkdirSync(assets, { recursive: true });
-fs.writeFileSync(path.join(assets, 'dl-rs.ico'), Buffer.concat([directory, ...images]));
+fs.writeFileSync(path.join(assets, 'dl-conn-rs.ico'), Buffer.concat([directory, ...images]));
 fs.writeFileSync(path.join(assets, 'icon-64.rgba'), draw(64));

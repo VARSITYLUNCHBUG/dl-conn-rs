@@ -1,5 +1,5 @@
 # Everything that must pass before calling a change done, without admin rights. The release build
-# goes to target\dist, so a running dl-rs elsewhere can't lock it, and it fails on any machine path.
+# goes to target\dist, so a running dl-conn-rs elsewhere can't lock it, and it fails on any machine path.
 param([switch]$SkipBuild)
 $ErrorActionPreference = 'Stop'
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
@@ -16,14 +16,16 @@ function Step($name, [scriptblock]$action) {
 Step 'format' { cargo fmt --check }
 
 Write-Output '--- ascii'
-$bad = Get-ChildItem src, examples -Filter *.rs -Recurse | Select-String -Pattern '[^\x00-\x7F]' -CaseSensitive
+$files = @(Get-ChildItem src, examples -Filter *.rs -Recurse) + @(Get-ChildItem README.md, docs -Filter *.md -Recurse)
+$bad = $files | Select-String -Pattern '[^\x00-\x7F]' -CaseSensitive
 if ($bad) {
     $bad | Select-Object -First 10 | ForEach-Object { "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
     $failed += 'ascii'
 }
 
 Write-Output '--- commit rule'
-if ((git config core.hooksPath) -ne '.githooks') {
+# Worktrees may point at the main checkout's folder by absolute path.
+if ((git config core.hooksPath) -notmatch '(^|[\\/])\.githooks[\\/]?$') {
     Write-Output 'core.hooksPath is not set. Run: git config core.hooksPath .githooks'
     $failed += 'commit rule'
 }

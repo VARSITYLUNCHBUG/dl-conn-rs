@@ -168,7 +168,7 @@ impl Client {
         unsafe {
             let session = Handle::new(
                 WinHttpOpen(
-                    w!("dl-rs"),
+                    w!("dl-conn-rs"),
                     WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                     null(),
                     null(),

@@ -44,7 +44,7 @@ fn block(engine: &Engine, ip: Ipv4Addr) {
 /// are what prove a block.
 fn udp_send(ip: Ipv4Addr) {
     let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-    let _ = socket.send_to(b"dl-rs test", (ip, RELAY_PORT));
+    let _ = socket.send_to(b"dl-conn-rs test", (ip, RELAY_PORT));
 }
 
 /// A connected UDP socket to a public DNS resolver. Relays ignore stray packets, so they can't
@@ -190,7 +190,7 @@ fn clear_any_block() {
 fn prints_the_report_for_the_real_log() {
     let (text, context) = crate::diag::read_log(None).unwrap();
     let context = crate::analysis::Context {
-        pick: std::env::var("DLRS_PICK").unwrap_or_default(),
+        pick: std::env::var("DL_CONN_RS_PICK").unwrap_or_default(),
         ..context
     };
     let log = crate::analysis::parse(&text);

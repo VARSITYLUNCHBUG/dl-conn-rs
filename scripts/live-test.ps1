@@ -2,7 +2,7 @@
 # posted keys and UI Automation, reads the window title and the app's log file, and uses the real mouse
 # near the end. It switches picks, so don't run it during a match. Run from an admin shell after building:
 #   cargo test --no-run; cargo build --release
-#   powershell -ExecutionPolicy Bypass -File scripts\live-test.ps1 -TestExe <target\debug\deps\dl_rs-*.exe> -AppExe <target\release\dl-rs.exe> -OutDir <dir>
+#   powershell -ExecutionPolicy Bypass -File scripts\live-test.ps1 -TestExe <target\debug\deps\dl_conn_rs-*.exe> -AppExe <target\release\dl-conn-rs.exe> -OutDir <dir>
 param(
     [Parameter(Mandatory)][string]$TestExe,
     [Parameter(Mandatory)][string]$OutDir,
@@ -15,7 +15,7 @@ $OutDir = (Resolve-Path $OutDir).Path
 $data = Join-Path $OutDir 'data'
 Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $data | Out-Null
-$env:DL_RS_DATA_DIR = $data
+$env:DL_CONN_RS_DATA_DIR = $data
 $log = Join-Path $OutDir 'results.txt'
 Set-Content $log "started $(Get-Date)"
 function Note($text) { Add-Content $log $text }
@@ -129,7 +129,7 @@ try {
 
     Note "--- console"
     ToggleConsole $app.Hwnd
-    Check 'backtick opens the console' ($null -ne (UiFindEdit $app.Hwnd 'dl-rs>'))
+    Check 'backtick opens the console' ($null -ne (UiFindEdit $app.Hwnd 'dl-conn-rs>'))
     for ($i = 0; $i -lt 8; $i++) { UdpSend $shut; Start-Sleep -Seconds 1 }
     Check 'the log has history from before it opened' (LogHas 'start: active')
     Check 'a dropdown choice is logged as a command' (LogHas "> set pick $openCode")
@@ -142,13 +142,13 @@ try {
     Note "--- console: typing"
     RunCommand $app.Hwnd 'stop report'
     Check 'a typed command runs and echoes' (LogHas '> stop report')
-    SetText $app.Hwnd 'dl-rs>' 'list se'
+    SetText $app.Hwnd 'dl-conn-rs>' 'list se'
     Press $app.Hwnd $VK_TAB 300
     Check 'tab completes a word' ((PromptText $app.Hwnd) -eq 'list servers ')
     Press $app.Hwnd $VK_ESCAPE 300
     Check 'esc clears the line' ((PromptText $app.Hwnd) -eq '')
-    Check 'and stays on the console' ($null -ne (UiFindEdit $app.Hwnd 'dl-rs>'))
-    SetText $app.Hwnd 'dl-rs>' 's'
+    Check 'and stays on the console' ($null -ne (UiFindEdit $app.Hwnd 'dl-conn-rs>'))
+    SetText $app.Hwnd 'dl-conn-rs>' 's'
     Press $app.Hwnd $VK_TAB 200
     Press $app.Hwnd $VK_TAB 300
     Check 'second tab lists options with notes' (LogHas 'show\s+status')
@@ -187,7 +187,7 @@ try {
 
     Note "--- console: logging while typing"
     RunCommand $app.Hwnd 'start report --every 1'
-    SetText $app.Hwnd 'dl-rs>' 'list se'
+    SetText $app.Hwnd 'dl-conn-rs>' 'list se'
     $before = LogCount $data 'processes:'
     Start-Sleep -Seconds 3
     Check 'log keeps going while typing' ((LogCount $data 'processes:') -gt $before)
@@ -198,7 +198,7 @@ try {
 
     Note "--- pages"
     ToggleConsole $app.Hwnd
-    Check 'backtick closes the console' ($null -eq (UiFindEdit $app.Hwnd 'dl-rs>' 1))
+    Check 'backtick closes the console' ($null -eq (UiFindEdit $app.Hwnd 'dl-conn-rs>' 1))
     foreach ($page in @(@($VK_F1, 'CUSTOM GAME', 'f1'), @($VK_F2, 'Hold filter updates in game', 'f2'), @($VK_F3, 'FINDINGS|game log', 'f3'))) {
         Press $app.Hwnd $page[0] 1000
         Check "$($page[2]) opens its page" (@(UiNames $app.Hwnd | Where-Object { $_ -match $page[1] }).Count -gt 0)
@@ -277,11 +277,11 @@ catch {
     Note "FAIL  script error: $_ at line $($_.InvocationInfo.ScriptLineNumber)"
 }
 finally {
-    Get-Process dl-rs -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process dl-conn-rs -ErrorAction SilentlyContinue | Stop-Process -Force
     RunTest 'live_tests::clear_any_block'
     Push-Location $OutDir
     & netsh wfp show state file=state-final.xml | Out-Null
     Pop-Location
-    Check 'nothing left behind' (-not (Select-String -Path (Join-Path $OutDir 'state-final.xml') -SimpleMatch 'dl-rs' -Quiet))
+    Check 'nothing left behind' (-not (Select-String -Path (Join-Path $OutDir 'state-final.xml') -SimpleMatch 'dl-conn-rs' -Quiet))
     Note "finished with $($script:failures) failures"
 }

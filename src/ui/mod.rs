@@ -30,35 +30,35 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::w;
 
-const APP_NAME: &str = "dl-rs";
+const APP_NAME: &str = "dl-conn-rs";
 const ICON: &[u8] = include_bytes!("../../assets/icon-64.rgba");
 const ICON_SIZE: u32 = 64;
 const WINDOW_SIZE: [f32; 2] = [720.0, 700.0];
 const MIN_SIZE: [f32; 2] = [560.0, 480.0];
 /// Forces the Windows software renderer, for testing and for machines with a bad graphics driver.
-const RENDERER_OVERRIDE: &str = "DL_RS_RENDERER";
+const RENDERER_OVERRIDE: &str = "DL_CONN_RS_RENDERER";
 const EVENT_MODIFY_STATE: u32 = 2;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 
 /// Shows an error when there may be no window to show it in.
 fn message(text: &str) {
     let text = wide(text);
-    unsafe { MessageBoxW(null_mut(), text.as_ptr(), w!("dl-rs"), MB_ICONERROR) };
+    unsafe { MessageBoxW(null_mut(), text.as_ptr(), w!("dl-conn-rs"), MB_ICONERROR) };
 }
 
 fn warning(text: &str) {
     let text = wide(text);
-    unsafe { MessageBoxW(null_mut(), text.as_ptr(), w!("dl-rs"), MB_ICONWARNING) };
+    unsafe { MessageBoxW(null_mut(), text.as_ptr(), w!("dl-conn-rs"), MB_ICONWARNING) };
 }
 
 /// Records a crash and says so. The block stays on, which is the safe side.
 fn install_panic_handler() {
     std::panic::set_hook(Box::new(|info| {
-        let text = format!("dl-rs stopped because of an internal error: {info}");
+        let text = format!("dl-conn-rs stopped because of an internal error: {info}");
         log::emergency(&text);
         message(&format!(
             "{text}\n\nAny block already on stays on until you pick again or restart the PC. \
-             Details are in dl-rs.log, in the app's data folder."
+             Details are in dl-conn-rs.log, in the app's data folder."
         ));
     }));
 }
@@ -83,7 +83,7 @@ fn graphics() -> WgpuConfiguration {
     setup.power_preference = wgpu::PowerPreference::LowPower;
     // A small window has little to store, so ask for small graphics memory blocks.
     setup.device_descriptor = Arc::new(|_adapter| wgpu::DeviceDescriptor {
-        label: Some("dl-rs"),
+        label: Some("dl-conn-rs"),
         required_limits: wgpu::Limits {
             max_texture_dimension_2d: 8192,
             ..wgpu::Limits::default()
@@ -111,7 +111,7 @@ fn graphics() -> WgpuConfiguration {
 /// Lets a later launch bring this one forward. A named event is used because the window class name
 /// belongs to the windowing library.
 fn listen_for_second_launch(ctx: Context) {
-    let event = unsafe { CreateEventW(null(), 0, 0, w!("Global\\dl-rs-show")) } as usize;
+    let event = unsafe { CreateEventW(null(), 0, 0, w!("Global\\dl-conn-rs-show")) } as usize;
     if event == 0 {
         return;
     }
@@ -131,7 +131,7 @@ fn ask_first_launch_to_show() {
         let event = OpenEventW(
             EVENT_MODIFY_STATE | SYNCHRONIZE,
             0,
-            w!("Global\\dl-rs-show"),
+            w!("Global\\dl-conn-rs-show"),
         );
         if !event.is_null() {
             SetEvent(event);
@@ -156,7 +156,7 @@ fn window() -> eframe::NativeOptions {
     eframe::NativeOptions {
         event_loop_builder,
         viewport: egui::ViewportBuilder::default()
-            .with_title("dl-rs - loading")
+            .with_title("dl-conn-rs - loading")
             .with_inner_size(WINDOW_SIZE)
             .with_min_inner_size(MIN_SIZE)
             .with_icon(icon),
@@ -181,7 +181,7 @@ fn open_window(firewall: impl Firewall) {
     if let Err(error) = started {
         log!("window failed: {error}");
         warning(&format!(
-            "dl-rs couldn't open its window: {error}\n\nIt needs DirectX 12, on Windows 10 or later. \
+            "dl-conn-rs couldn't open its window: {error}\n\nIt needs DirectX 12, on Windows 10 or later. \
              Any block already on is unchanged, and lasts until you restart the PC."
         ));
     }
@@ -191,23 +191,23 @@ pub fn run() {
     install_panic_handler();
     unsafe {
         // Filters are machine-wide, so two copies anywhere on this PC would fight over them.
-        CreateMutexW(null(), 0, w!("Global\\dl-rs"));
+        CreateMutexW(null(), 0, w!("Global\\dl-conn-rs"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
             ask_first_launch_to_show();
             return;
         }
     }
     if let Some(folder) = crate::diag::data_dir() {
-        log::to_file(folder.join("dl-rs.log"));
+        log::to_file(folder.join("dl-conn-rs.log"));
     }
-    log!("dl-rs {} starting", env!("CARGO_PKG_VERSION"));
+    log!("dl-conn-rs {} starting", env!("CARGO_PKG_VERSION"));
     let engine = match Engine::open() {
         Ok(engine) => engine,
         Err(error) => {
             log!("filtering platform failed: {error}");
             message(&format!(
-                "dl-rs couldn't open the Windows Filtering Platform: {error}\n\nCheck that the Base \
-                 Filtering Engine service is running, then open dl-rs again."
+                "dl-conn-rs couldn't open the Windows Filtering Platform: {error}\n\nCheck that the Base \
+                 Filtering Engine service is running, then open dl-conn-rs again."
             ));
             return;
         }
@@ -246,7 +246,7 @@ mod adapter_tests {
     #[ignore = "opens the real window on the main thread; run with --test-threads=1"]
     fn window_with_a_fake_firewall() {
         if let Some(folder) = crate::diag::data_dir() {
-            log::to_file(folder.join("dl-rs.log"));
+            log::to_file(folder.join("dl-conn-rs.log"));
         }
         open_window(FakeFirewall::default());
     }

@@ -16,7 +16,7 @@ use std::collections::{HashMap, VecDeque};
 
 const MONO: f32 = 13.0;
 const LABEL_WIDTH: f32 = 210.0;
-const PROMPT: &str = "dl-rs>";
+const PROMPT: &str = "dl-conn-rs>";
 /// How much history the console page keeps on screen.
 const CONSOLE_LINES: usize = 20_000;
 
@@ -162,7 +162,7 @@ pub fn status_page(ui: &mut Ui, status: Option<&Status>) {
     ui.add_space(14.0);
     ui.colored_label(
         colours(ui).muted,
-        "A block lasts until you pick again or restart the PC, even after dl-rs closes.",
+        "A block lasts until you pick again or restart the PC, even after dl-conn-rs closes.",
     );
     ui.colored_label(
         colours(ui).muted,
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(classify("FINDINGS"), LineKind::Heading);
         assert_eq!(classify("PING TABLE AT 18:46:31"), LineKind::Heading);
         assert_eq!(classify("STEP 1: TURN ON LOGGING"), LineKind::Heading);
-        assert_eq!(classify("dl-rs log report"), LineKind::Plain);
+        assert_eq!(classify("dl-conn-rs log report"), LineKind::Plain);
         assert_eq!(classify("Direct"), LineKind::Plain);
         assert_eq!(classify("  F1    This help"), LineKind::Plain);
         assert_eq!(
