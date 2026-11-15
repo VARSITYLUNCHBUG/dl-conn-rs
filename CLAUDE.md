@@ -67,6 +67,7 @@ window --- command lines --> command.rs parses --> session.rs --> wfp / sdr / di
 | `src/sdr.rs` | Relay lists, and working out what to block |
 | `scripts/drive.ps1` | How scripts drive the window without taking focus |
 | `examples/loadsim.rs` | Rate-capped, game-shaped UDP for tests. Not in the app |
+| `examples/fullscreen.rs` | Takes the screen in exclusive fullscreen like a game, for tests. Not in the app |
 
 Pure logic goes in a module with no Windows calls so it can be unit tested. Windows code stays thin.
 
@@ -90,7 +91,9 @@ fails on any machine path. It builds to `target/dist`, so a running dl-conn-rs e
 
 `scripts/window-check.ps1` opens the real window with a fake firewall and measures start time and idle
 cost on both renderers. It needs no admin rights and can't change a block, so it's safe with a game
-running. `scripts/live-test.ps1` uses real filters and needs a UAC prompt.
+running. `scripts/live-test.ps1` uses real filters and needs a UAC prompt. `scripts/fullscreen-repro.ps1`
+uses the same fake firewall, takes the screen in exclusive fullscreen for a few seconds, and measures
+whether the window's frame moved. It blacks out the screen, so never run it during a match.
 
 ## Facts learned the hard way
 
@@ -131,9 +134,22 @@ running. `scripts/live-test.ps1` uses real filters and needs a UAC prompt.
 **egui**
 - winit never sends `Occluded` on Windows, and eframe isn't told about display or work-area changes.
   A hidden window in `ui/mod.rs` hears `WM_DISPLAYCHANGE` and `WM_SETTINGCHANGE` and asks for a few
-  redraws. It was added for a report of a shifted frame with a white strip after a fullscreen game
-  started, fixed by moving the window. Covering the window with a borderless fullscreen form didn't
-  reproduce it, so the cause is unconfirmed.
+  redraws.
+- After a DXGI exclusive fullscreen app changes the display mode and gives it back, Windows shows the
+  window's frame at the window's outer corner instead of the client area: up and left by the border
+  and title bar (8 and 31 px at 96 DPI), hiding the picker row and leaving a white strip right and
+  bottom. Layout, input and new frames are all correct, so a redraw never fixes it. Deadlock does
+  this: its `video.txt` had exclusive fullscreen at 1600x900 against a 1920x1080 desktop.
+  `scripts/fullscreen-repro.ps1` reproduces it on this PC (GTX 1070 Ti, Windows 10 19045) at
+  1600x900, 1280x720 and with only a refresh change (144 to 120 Hz), already on the switch into the
+  game's mode. Exclusive fullscreen with no mode change, and a plain `ChangeDisplaySettingsEx` with no
+  DirectX, didn't. `WGPU_DX12_PRESENTATION_SYSTEM=Visual` didn't help, though which path wgpu took
+  wasn't confirmed. A borderless fullscreen form changes no mode, which is why it never reproduced.
+- Only a real move puts the frame back. A same-place `SetWindowPos`, even with `SWP_FRAMECHANGED`,
+  doesn't. So on `WM_DISPLAYCHANGE` the listener moves the window 1 px and back at 250 ms, 1 s and
+  3 s, without activating it, and logs `display changed to WxH`. Against the last release build the
+  repro showed the shift at 1280x720 and 1600x900 and the fixed build didn't, and the fullscreen app
+  stayed exclusive through the moves.
 - `egui_kittest` renders use egui's default panel colour, not the palette. Check colours in the real
   window.
 - Egui takes focus away on Esc before widgets run, unless `set_focus_lock_filter` keeps it.
@@ -194,8 +210,8 @@ running. `scripts/live-test.ps1` uses real filters and needs a UAC prompt.
   and timed out. Check whether blocks break party hideout lobbies.
 - The route counter hasn't been seen against a live boosted match yet.
 - `No log` on Connection Hold is unit tested only. Check it with a launch without `-condebug`.
-- The redraw on a display change is checked only by posting `WM_DISPLAYCHANGE` to the listener.
-  Confirm the fullscreen glitch is gone with the game.
+- The nudge after a display change fixes the shifted frame in `scripts/fullscreen-repro.ps1`. Confirm
+  it with the game, and check a maximized or snapped window, which haven't been tried.
 - `--backup` is written and unit tested, but not yet confirmed against the game.
 - In a match under a strict Singapore block, the game ran 7 minutes with no backup, then logged
   `Selecting tyo#172 as backup #1` at 18:53:54, 8 s before the player left. Most likely the block

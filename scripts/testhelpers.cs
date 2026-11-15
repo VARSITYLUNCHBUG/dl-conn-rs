@@ -28,4 +28,21 @@ public static class W {
   [StructLayout(LayoutKind.Sequential)] public struct RECT{public int L,T,R,B;}
   public static string Title(IntPtr h){var s=new StringBuilder(512);GetWindowText(h,s,512);return s.ToString();}
   public static void Shot(IntPtr h,string path){RECT r;GetWindowRect(h,out r);using(var b=new Bitmap(r.R-r.L,r.B-r.T))using(var g=Graphics.FromImage(b)){var dc=g.GetHdc();PrintWindow(h,dc,2);g.ReleaseHdc(dc);b.Save(path);}}
+  [StructLayout(LayoutKind.Sequential)] public struct POINT{public int X,Y;}
+  [DllImport("user32")] static extern bool GetClientRect(IntPtr h,out RECT r);
+  [DllImport("user32")] static extern bool ClientToScreen(IntPtr h,ref POINT p);
+  // The client area inside a Shot: left, top, width, height.
+  public static int[] Client(IntPtr h){RECT w,c;GetWindowRect(h,out w);GetClientRect(h,out c);var p=new POINT();ClientToScreen(h,ref p);return new[]{p.X-w.L,p.Y-w.T,c.R,c.B};}
+  // How far the client area's picture in 'after' has moved from 'before', as dx, dy (negative is up
+  // or left), and the share of sampled pixels that still differ at that offset.
+  public static double[] Shift(string before,string after,int[] client,int maxDx,int maxDy){
+    using(var a=new Bitmap(before))using(var b=new Bitmap(after)){
+      int l=client[0],t=client[1],w=client[2],ht=client[3];
+      int[,] pa=Gray(a,l,t,w,ht),pb=Gray(b,l,t,w,ht);
+      int bestX=0,bestY=0;double best=Diff(pa,pb,0,0,w,ht,maxDx,maxDy);
+      for(int dy=-maxDy;dy<=maxDy;dy++)for(int dx=-maxDx;dx<=maxDx;dx++){double d=Diff(pa,pb,dx,dy,w,ht,maxDx,maxDy);if(d<best){best=d;bestX=dx;bestY=dy;}}
+      return new double[]{bestX,bestY,best};}}
+  static int[,] Gray(Bitmap b,int l,int t,int w,int h){var g=new int[w,h];for(int y=0;y<h;y++)for(int x=0;x<w;x++){var c=b.GetPixel(l+x,t+y);g[x,y]=c.R+c.G+c.B;}return g;}
+  // after(x,y) is compared with before(x-dx,y-dy), over the part both cover whatever the shift.
+  static double Diff(int[,] a,int[,] b,int dx,int dy,int w,int h,int mx,int my){int n=0,bad=0;for(int y=my;y<h-my;y+=2)for(int x=mx;x<w-mx;x+=2){n++;if(Math.Abs(b[x,y]-a[x-dx,y-dy])>24)bad++;}return n==0?1:(double)bad/n;}
 }
