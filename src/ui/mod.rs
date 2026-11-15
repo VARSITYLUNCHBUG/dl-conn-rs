@@ -19,12 +19,12 @@ use eframe::egui::{self, Context, ViewportCommand};
 use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
 use eframe::wgpu;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
+    ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{
@@ -32,8 +32,9 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GetMessageW, MB_ICONERROR, MB_ICONWARNING, MSG, MessageBoxW, RegisterClassW, WM_DISPLAYCHANGE,
-    WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
+    GetMessageW, GetWindowRect, IsIconic, MB_ICONERROR, MB_ICONWARNING, MSG, MessageBoxW,
+    RegisterClassW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    WM_DISPLAYCHANGE, WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows_sys::w;
 
@@ -131,13 +132,41 @@ fn listen_for_second_launch(ctx: Context) {
     });
 }
 
-/// Redraws after Windows changes the display or the desktop's work area, as a fullscreen game can.
-/// The window only draws on a change and eframe isn't told about these, so a stale frame could stay
-/// on screen, shifted and with a blank strip, until something else made it draw. A hidden window
-/// gets these broadcasts. Each one asks for a few redraws, because the desktop may still be settling.
-fn repaint_on_display_change(ctx: Context) {
+/// The app window's handle, from eframe, so the display listener can move it.
+fn main_window(creation: &eframe::CreationContext) -> Option<usize> {
+    use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+    match creation.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as usize),
+        _ => None,
+    }
+}
+
+/// Moves the window 1 px and back. After a game in exclusive fullscreen changes the display mode and
+/// gives it back, Windows can show this window's frame up and left by the border and title bar, with
+/// a white strip right and bottom. Layout and input stay right, and only a real move puts the frame
+/// back: a redraw or a same-place `SetWindowPos`, even with `SWP_FRAMECHANGED`, doesn't.
+/// `scripts/fullscreen-repro.ps1` reproduces it.
+fn nudge(window: HWND) {
+    unsafe {
+        let mut rect: RECT = std::mem::zeroed();
+        if IsIconic(window) != 0 || GetWindowRect(window, &mut rect) == 0 {
+            return;
+        }
+        let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE;
+        SetWindowPos(window, null_mut(), rect.left + 1, rect.top, 0, 0, flags);
+        SetWindowPos(window, null_mut(), rect.left, rect.top, 0, 0, flags);
+    }
+}
+
+/// Redraws after Windows changes the display or the desktop's work area, as a fullscreen game can,
+/// and after a display mode change also nudges the window back into place. The window only draws on
+/// a change and eframe isn't told about these. A hidden window gets these broadcasts. Each one asks
+/// for a few rounds, because the desktop may still be settling.
+fn refresh_on_display_change(ctx: Context, window: Option<usize>) {
     static CONTEXT: OnceLock<Context> = OnceLock::new();
+    static WINDOW: AtomicUsize = AtomicUsize::new(0);
     static SCHEDULED: AtomicBool = AtomicBool::new(false);
+    static MODE_CHANGED: AtomicBool = AtomicBool::new(false);
     const CLASS: *const u16 = w!("dl-conn-rs-display");
 
     unsafe extern "system" fn handle(
@@ -146,6 +175,14 @@ fn repaint_on_display_change(ctx: Context) {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        if message == WM_DISPLAYCHANGE {
+            log!(
+                "display changed to {}x{}",
+                lparam & 0xFFFF,
+                (lparam >> 16) & 0xFFFF
+            );
+            MODE_CHANGED.store(true, Ordering::SeqCst);
+        }
         if matches!(message, WM_DISPLAYCHANGE | WM_SETTINGCHANGE)
             && let Some(ctx) = CONTEXT.get()
             && !SCHEDULED.swap(true, Ordering::SeqCst)
@@ -154,8 +191,13 @@ fn repaint_on_display_change(ctx: Context) {
             thread::spawn(move || {
                 for wait in [0, 250, 1000, 3000] {
                     thread::sleep(Duration::from_millis(wait));
+                    let app = WINDOW.load(Ordering::SeqCst);
+                    if wait > 0 && app != 0 && MODE_CHANGED.load(Ordering::SeqCst) {
+                        nudge(app as HWND);
+                    }
                     ctx.request_repaint();
                 }
+                MODE_CHANGED.store(false, Ordering::SeqCst);
                 SCHEDULED.store(false, Ordering::SeqCst);
             });
         }
@@ -165,6 +207,7 @@ fn repaint_on_display_change(ctx: Context) {
     if CONTEXT.set(ctx).is_err() {
         return;
     }
+    WINDOW.store(window.unwrap_or(0), Ordering::SeqCst);
     thread::spawn(|| unsafe {
         let instance = GetModuleHandleW(null());
         let mut class: WNDCLASSW = std::mem::zeroed();
@@ -248,7 +291,7 @@ fn open_window(firewall: impl Firewall) {
             let ctx = creation.egui_ctx.clone();
             theme::install(&ctx);
             listen_for_second_launch(ctx.clone());
-            repaint_on_display_change(ctx.clone());
+            refresh_on_display_change(ctx.clone(), main_window(creation));
             let app = App::start(ctx, |host| session::spawn(firewall, host));
             Ok(Box::new(app))
         }),

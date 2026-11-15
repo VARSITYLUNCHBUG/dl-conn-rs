@@ -49,6 +49,8 @@ embed-resource = "3"
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["snapshot", "wgpu"] }
 winit = "0.30"
+# Display mode changes, for examples/fullscreen.rs only.
+windows-sys = { version = "0.61", features = ["Win32_Graphics_Gdi"] }
 
 [profile.release]
 opt-level = "z"
