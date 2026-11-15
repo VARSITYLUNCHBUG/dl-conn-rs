@@ -18,10 +18,10 @@ ExitLag's nodes, yet its packets to blocked relays were still dropped before ent
 To check your own setup, boost the game, open the console and look for lines such as
 `blocked deadlock.exe -> waw`.
 
-## Counters with ExitLag
+## Status chips with ExitLag
 
 - **Direct** pings are not boosted, so they can differ a lot from the game's real path.
-- The second counter reads **ExitLag route** while ExitLag is running. It shows the figure the game
+- The **Game** chip reads **ExitLag** while ExitLag is running. It shows the figure the game
   logged. A running ExitLag doesn't prove the game was boosted at that moment.
 - If the log report says the route looks slower than direct, try another route or server in
   ExitLag.

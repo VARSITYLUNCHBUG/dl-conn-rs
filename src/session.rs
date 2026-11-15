@@ -3,12 +3,12 @@
 //! Front-ends only send command lines to a [`Handle`]. The session knows nothing about windows; a
 //! [`Host`] gives it the few things it needs from whichever front-end started it.
 
-use crate::analysis;
+use crate::analysis::{self, GameView};
 use crate::command::{self, Command, ServerName};
 use crate::diag;
 use crate::guide;
 use crate::log;
-use crate::monitor::{self, Control, Direct, Monitor};
+use crate::monitor::{self, Chip, Control, Direct, GameLog, Monitor};
 use crate::sdr::{self, Blocks, Client, Pops};
 use crate::settings::{self, Row, Settings};
 use crate::wfp::Engine;
@@ -80,6 +80,32 @@ pub struct Status {
     pub offline: bool,
     pub error: Option<String>,
     pub monitor: Monitor,
+    /// A pick waiting for the match to end, so switching doesn't cut it.
+    pub pending: Option<String>,
+    /// Whether the game's ping table matches the block.
+    pub view: GameView,
+}
+
+impl Status {
+    /// Whether a pick waits for a match, and what a switch still needs.
+    pub fn hold_chip(&self) -> Option<Chip> {
+        monitor::hold_chip(
+            &self.pick,
+            self.pending.as_deref(),
+            self.view,
+            &self.monitor,
+        )
+    }
+
+    /// The counters and the hold, in the order the window shows them.
+    pub fn chips(&self) -> Vec<Chip> {
+        let mut chips: Vec<Chip> = monitor::direct_chip(&self.pick, &self.monitor)
+            .into_iter()
+            .collect();
+        chips.push(monitor::route_chip(&self.pick, &self.monitor));
+        chips.extend(self.hold_chip());
+        chips
+    }
 }
 
 /// A command's result as data, so a UI never has to parse text.
@@ -87,7 +113,7 @@ pub struct Status {
 pub enum Output {
     Lines(Vec<String>),
     Servers(Vec<Server>),
-    Status(Status),
+    Status(Box<Status>),
     Config(Vec<Row>),
 }
 
@@ -137,8 +163,7 @@ impl Output {
                 if let Some(error) = &status.error {
                     lines.push(format!("error: {error}"));
                 }
-                lines.push(monitor::direct_label(&status.pick, &status.monitor));
-                lines.push(monitor::route_label(&status.pick, &status.monitor));
+                lines.extend(status.chips().iter().map(Chip::line));
                 lines
             }
             Self::Config(rows) => rows
@@ -197,6 +222,12 @@ impl Handle {
     #[cfg(test)]
     pub fn inject_relays(&self, pops: Pops) {
         let _ = self.tx.send(Message::Relays(pops));
+    }
+
+    /// Hands the session a counter update, as the monitor thread would.
+    #[cfg(test)]
+    pub fn inject_monitor(&self, state: Monitor) {
+        let _ = self.tx.send(Message::Monitor(state));
     }
 
     /// The known servers for completion. Available immediately, even during a slow command.
@@ -347,6 +378,8 @@ struct Session<F, H> {
     pops: Pops,
     pick: String,
     backup: Option<String>,
+    /// A pick and backup waiting for the match to end. Memory only: the active pick lives in WFP.
+    pending: Option<(String, Option<String>)>,
     offline: bool,
     error: Option<String>,
     report: Option<Report>,
@@ -371,6 +404,7 @@ impl<F: Firewall, H: Host> Session<F, H> {
             pops: Pops::new(),
             pick,
             backup,
+            pending: None,
             offline: false,
             error: None,
             report: None,
@@ -409,7 +443,7 @@ impl<F: Firewall, H: Host> Session<F, H> {
                 }
                 Ok(Message::Monitor(state)) => {
                     if state != self.monitor {
-                        self.monitor = state;
+                        self.monitor_changed(state);
                         self.host.changed();
                     }
                 }
@@ -475,6 +509,29 @@ impl<F: Firewall, H: Host> Session<F, H> {
             && (self.game_running)()
     }
 
+    /// Takes the monitor's new state, and applies a waiting pick once the match has ended.
+    fn monitor_changed(&mut self, state: Monitor) {
+        self.monitor = state;
+        if self.in_match().is_none()
+            && let Some((server, backup)) = self.pending.take()
+        {
+            log!("match ended, switching to {server}");
+            if let Err(error) = self.apply_pick(server, backup) {
+                log!("switch failed: {error}");
+            }
+        }
+    }
+
+    /// The site of the match being played, if the game's log shows one. A hideout lobby isn't a
+    /// match, and neither is anything once the game has closed.
+    fn in_match(&self) -> Option<&str> {
+        monitor::match_site(&self.monitor)
+    }
+
+    fn cant_see_matches(&self) -> bool {
+        !self.monitor.log_found || self.monitor.game_log == GameLog::Silent
+    }
+
     /// Tells the monitor which relays to ping, when that has changed.
     fn sync_monitor(&mut self) {
         let Some(control) = &self.control else {
@@ -499,9 +556,17 @@ impl<F: Firewall, H: Host> Session<F, H> {
             Command::Help { topic } => command::help(topic.as_deref()).map(Output::Lines),
             Command::ListServers { filter } => Ok(self.list_servers(filter.as_deref())),
             Command::ListRelays { server } => self.list_relays(server.as_deref()),
-            Command::ShowStatus => Ok(Output::Status(self.status())),
-            Command::SetPick { server, backup } => self.set_pick(server, backup),
+            Command::ShowStatus => Ok(Output::Status(Box::new(self.status()))),
+            Command::SetPick {
+                server,
+                backup,
+                now,
+            } => self.set_pick(server, backup, now),
             Command::ClearPick => self.clear_pick(),
+            Command::ClearPending => Ok(Output::line(match self.pending.take() {
+                Some((server, _)) => format!("{server} won't be picked when the match ends"),
+                None => "no pick is waiting".to_string(),
+            })),
             Command::RefreshRelays => {
                 let _ = self.wake.send(Wake::Now);
                 Ok(Output::line("refreshing relays".to_string()))
@@ -674,13 +739,18 @@ impl<F: Firewall, H: Host> Session<F, H> {
             offline: self.offline,
             error: self.error.clone(),
             monitor: self.monitor.clone(),
+            pending: self.pending.as_ref().map(|(server, _)| server.clone()),
+            view: analysis::game_view(&self.monitor.table, &self.open_sites()),
         }
     }
 
     /// A pick states the whole intent: its backup, or `none` for no backup, or the default backup
     /// if it names neither. A default that can't be used falls back to strict with a note, because
     /// a stale setting must never stop a pick.
-    fn set_pick(&mut self, server: String, backup: Option<String>) -> Reply {
+    ///
+    /// Mid-match, a pick that would close the match's relay site waits for the match to end,
+    /// because the block would cut the connection. `now` switches anyway.
+    fn set_pick(&mut self, server: String, backup: Option<String>, now: bool) -> Reply {
         self.known(&server)?;
         let backup = match backup.as_deref() {
             Some("none") => None,
@@ -690,6 +760,26 @@ impl<F: Firewall, H: Host> Session<F, H> {
             }
             None => self.default_backup(&server),
         };
+        if !now
+            && let Some(site) = self.in_match()
+            && site != server
+            && backup.as_deref() != Some(site)
+        {
+            log!("in a match on {site}, so {server} waits for it to end");
+            self.pending = Some((server, backup));
+            return Ok(Output::Status(Box::new(self.status())));
+        }
+        if !now && self.monitor.game && self.cant_see_matches() {
+            log!(
+                "the game isn't writing its log, so a match can't be seen and {server} applies at once"
+            );
+        }
+        self.apply_pick(server, backup)
+    }
+
+    /// Makes a resolved pick and backup active.
+    fn apply_pick(&mut self, server: String, backup: Option<String>) -> Reply {
+        self.pending = None;
         let changed = server != self.pick || backup != self.backup;
         if server != self.pick {
             // A figure for the last pick would be wrong until the monitor measures this one.
@@ -703,7 +793,7 @@ impl<F: Firewall, H: Host> Session<F, H> {
         if changed {
             let _ = self.wake.send(Wake::Soon);
         }
-        Ok(Output::Status(self.status()))
+        Ok(Output::Status(Box::new(self.status())))
     }
 
     fn default_backup(&self, server: &str) -> Option<String> {
@@ -719,14 +809,16 @@ impl<F: Firewall, H: Host> Session<F, H> {
         }
     }
 
+    /// Only opens relays, so it never waits for a match.
     fn clear_pick(&mut self) -> Reply {
+        self.pending = None;
         self.monitor.direct = Direct::NoPick;
         self.pick.clear();
         self.backup = None;
         let result = self.reconcile();
         self.sync_monitor();
         result?;
-        Ok(Output::Status(self.status()))
+        Ok(Output::Status(Box::new(self.status())))
     }
 
     /// The sites to keep open: none, the pick, or the pick and its backup.
@@ -822,6 +914,7 @@ impl<F: Firewall, H: Host> Session<F, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::RouteState;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]
@@ -933,7 +1026,9 @@ mod tests {
         let status = session.status();
         assert_eq!(status.backup.as_deref(), Some("waw"));
         assert_eq!((status.blocked, status.sites_blocked), (1, 1));
-        assert!(Output::Status(status).render()[0].contains("backup waw, 1 relays blocked"));
+        assert!(
+            Output::Status(Box::new(status)).render()[0].contains("backup waw, 1 relays blocked")
+        );
 
         let (wake, _wake_rx) = channel();
         let reopened = Session::new(firewall, FakeHost::default(), wake);
@@ -1067,7 +1162,7 @@ mod tests {
         let status = session.status();
         assert_eq!(status.pick_desc.as_deref(), Some("Frankfurt (Germany)"));
         assert_eq!((status.blocked, status.sites_blocked), (2, 2));
-        assert!(Output::Status(status).render()[0].contains("2 relays blocked"));
+        assert!(Output::Status(Box::new(status)).render()[0].contains("2 relays blocked"));
     }
 
     #[test]
@@ -1431,9 +1526,164 @@ mod tests {
         session.monitor.direct = Direct::Ms(40);
         let status = session.status();
         assert_eq!(status.monitor.direct, Direct::Ms(40));
-        let lines = Output::Status(status).render();
+        let lines = Output::Status(Box::new(status)).render();
         assert!(lines.iter().any(|line| line.starts_with("Direct: 40 ms")));
         assert!(lines.iter().any(|line| line.starts_with("Game:")));
+    }
+
+    /// What the monitor reports while the game's log shows a connection on `site`.
+    fn playing(state: RouteState, site: &str, game: bool) -> Monitor {
+        Monitor {
+            game,
+            game_log: if game {
+                GameLog::Writing
+            } else {
+                GameLog::NoGame
+            },
+            log_found: true,
+            route: Some(analysis::Route {
+                site: site.to_string(),
+                ms: 120,
+                at: "18:46".to_string(),
+                state,
+            }),
+            ..Monitor::default()
+        }
+    }
+
+    #[test]
+    fn a_pick_that_would_cut_the_match_waits_for_it_to_end() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        session.monitor_changed(playing(RouteState::InMatch, "fra", true));
+        let Output::Status(status) = run(&mut session, "set pick waw").unwrap() else {
+            panic!();
+        };
+        assert_eq!(writes(&firewall), 1, "the match's relays stay open");
+        assert_eq!(session.pick, "fra");
+        assert_eq!(status.pending.as_deref(), Some("waw"));
+        assert_eq!(status.hold_chip().unwrap().value, "waw after match");
+
+        session.monitor_changed(playing(RouteState::InMatch, "fra", true));
+        assert_eq!(writes(&firewall), 1, "still in the match");
+        session.monitor_changed(playing(RouteState::LastMatch, "fra", true));
+        assert_eq!(session.pick, "waw");
+        assert_eq!(session.pending, None);
+        assert!(firewall.stamp().unwrap().starts_with("waw "));
+    }
+
+    #[test]
+    fn a_pick_that_keeps_the_match_open_applies_at_once() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        session.monitor_changed(playing(RouteState::InMatch, "fra", true));
+        run(&mut session, "set pick waw --backup fra").unwrap();
+        assert!(firewall.stamp().unwrap().starts_with("waw+fra "));
+        assert_eq!(session.pending, None);
+    }
+
+    #[test]
+    fn now_switches_mid_match() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        session.monitor_changed(playing(RouteState::InMatch, "fra", true));
+        run(&mut session, "set pick waw --now").unwrap();
+        assert!(firewall.stamp().unwrap().starts_with("waw "));
+    }
+
+    #[test]
+    fn clearing_never_waits_and_drops_a_waiting_pick() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        session.monitor_changed(playing(RouteState::InMatch, "fra", true));
+        run(&mut session, "set pick waw").unwrap();
+        run(&mut session, "clear pick").unwrap();
+        assert_eq!(firewall.stamp(), None);
+        assert_eq!(session.pending, None);
+    }
+
+    #[test]
+    fn clear_pending_keeps_the_current_pick() {
+        let (mut session, firewall, _, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        session.monitor_changed(playing(RouteState::InMatch, "fra", true));
+        run(&mut session, "set pick waw").unwrap();
+        let output = run(&mut session, "clear pending").unwrap();
+        assert!(output.render()[0].contains("waw won't be picked"));
+        session.monitor_changed(playing(RouteState::LastMatch, "fra", true));
+        assert_eq!(session.pick, "fra");
+        assert_eq!(writes(&firewall), 1);
+        let output = run(&mut session, "clear pending").unwrap();
+        assert_eq!(output.render(), ["no pick is waiting"]);
+    }
+
+    #[test]
+    fn picking_the_current_server_again_drops_a_waiting_pick() {
+        let (mut session, _, _, _wake) = session();
+        run(&mut session, "set pick fra").unwrap();
+        session.monitor_changed(playing(RouteState::InMatch, "fra", true));
+        run(&mut session, "set pick waw").unwrap();
+        run(&mut session, "set pick fra").unwrap();
+        assert_eq!(session.pending, None);
+    }
+
+    #[test]
+    fn only_a_live_match_makes_a_pick_wait() {
+        for monitor in [
+            playing(RouteState::InLobby, "fra", true),
+            playing(RouteState::LastMatch, "fra", true),
+            playing(RouteState::InMatch, "fra", false),
+            Monitor {
+                game_log: GameLog::Silent,
+                ..playing(RouteState::InMatch, "fra", true)
+            },
+            Monitor::default(),
+        ] {
+            let (mut session, firewall, _, _wake) = session();
+            run(&mut session, "set pick fra").unwrap();
+            session.monitor_changed(monitor.clone());
+            run(&mut session, "set pick waw").unwrap();
+            assert!(
+                firewall.stamp().unwrap().starts_with("waw "),
+                "{monitor:?} should switch at once"
+            );
+        }
+    }
+
+    #[test]
+    fn status_says_when_the_game_needs_to_measure_again() {
+        let (mut session, _, _, _wake) = session();
+        run(&mut session, "set pick waw").unwrap();
+        let mut monitor = playing(RouteState::Measured, "fra", true);
+        monitor.table = vec![
+            analysis::PingEntry {
+                site: "fra".to_string(),
+                direct: Some(40),
+                via: None,
+                penalty: 0,
+            },
+            analysis::PingEntry {
+                site: "waw".to_string(),
+                direct: None,
+                via: Some(60),
+                penalty: 0,
+            },
+        ];
+        session.monitor_changed(monitor.clone());
+        let status = session.status();
+        assert_eq!(status.view, GameView::Stale);
+        assert_eq!(status.hold_chip().unwrap().value, "Restart game");
+        assert!(
+            Output::Status(Box::new(status))
+                .render()
+                .iter()
+                .any(|line| line.starts_with("Connection Hold: Restart game."))
+        );
+
+        run(&mut session, "set pick fra").unwrap();
+        let status = session.status();
+        assert_eq!(status.view, GameView::Ready { ms: 40 });
+        assert_eq!(status.hold_chip().unwrap().value, "Ready");
     }
 
     #[test]

@@ -19,14 +19,21 @@ use eframe::egui::{self, Context, ViewportCommand};
 use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
 use eframe::wgpu;
 use std::ptr::{null, null_mut};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+use std::time::Duration;
+use windows_sys::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
+};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{
     CreateEventW, CreateMutexW, INFINITE, OpenEventW, SetEvent, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ASFW_ANY, AllowSetForegroundWindow, MB_ICONERROR, MB_ICONWARNING, MessageBoxW,
+    ASFW_ANY, AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DispatchMessageW,
+    GetMessageW, MB_ICONERROR, MB_ICONWARNING, MSG, MessageBoxW, RegisterClassW, WM_DISPLAYCHANGE,
+    WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows_sys::w;
 
@@ -124,6 +131,73 @@ fn listen_for_second_launch(ctx: Context) {
     });
 }
 
+/// Redraws after Windows changes the display or the desktop's work area, as a fullscreen game can.
+/// The window only draws on a change and eframe isn't told about these, so a stale frame could stay
+/// on screen, shifted and with a blank strip, until something else made it draw. A hidden window
+/// gets these broadcasts. Each one asks for a few redraws, because the desktop may still be settling.
+fn repaint_on_display_change(ctx: Context) {
+    static CONTEXT: OnceLock<Context> = OnceLock::new();
+    static SCHEDULED: AtomicBool = AtomicBool::new(false);
+    const CLASS: *const u16 = w!("dl-conn-rs-display");
+
+    unsafe extern "system" fn handle(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if matches!(message, WM_DISPLAYCHANGE | WM_SETTINGCHANGE)
+            && let Some(ctx) = CONTEXT.get()
+            && !SCHEDULED.swap(true, Ordering::SeqCst)
+        {
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                for wait in [0, 250, 1000, 3000] {
+                    thread::sleep(Duration::from_millis(wait));
+                    ctx.request_repaint();
+                }
+                SCHEDULED.store(false, Ordering::SeqCst);
+            });
+        }
+        unsafe { DefWindowProcW(window, message, wparam, lparam) }
+    }
+
+    if CONTEXT.set(ctx).is_err() {
+        return;
+    }
+    thread::spawn(|| unsafe {
+        let instance = GetModuleHandleW(null());
+        let mut class: WNDCLASSW = std::mem::zeroed();
+        class.lpfnWndProc = Some(handle);
+        class.hInstance = instance;
+        class.lpszClassName = CLASS;
+        if RegisterClassW(&class) == 0 {
+            return;
+        }
+        let window = CreateWindowExW(
+            0,
+            CLASS,
+            CLASS,
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            null_mut(),
+            null_mut(),
+            instance,
+            null(),
+        );
+        if window.is_null() {
+            return;
+        }
+        let mut message: MSG = std::mem::zeroed();
+        while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+            DispatchMessageW(&message);
+        }
+    });
+}
+
 fn ask_first_launch_to_show() {
     unsafe {
         // This launch came from the user, so it's allowed to hand them the foreground.
@@ -174,6 +248,7 @@ fn open_window(firewall: impl Firewall) {
             let ctx = creation.egui_ctx.clone();
             theme::install(&ctx);
             listen_for_second_launch(ctx.clone());
+            repaint_on_display_change(ctx.clone());
             let app = App::start(ctx, |host| session::spawn(firewall, host));
             Ok(Box::new(app))
         }),

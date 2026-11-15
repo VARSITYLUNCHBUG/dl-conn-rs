@@ -16,6 +16,10 @@ admin exe for Windows 10 and 11, and Server 2016 and later, x64. See `README.md`
 - **UI text:** plain ASCII. No emoji or em dashes. `scripts/check.ps1` enforces this across `src/`.
 - **Docs:** user docs are `README.md` and the wiki pages in `docs/wiki`, held to the same plain ASCII.
   Keep them in step with behaviour. `scripts/publish-wiki.ps1` pushes `docs/wiki` to the GitHub wiki.
+- **No contact with the game (VAC):** never open a handle to a game process, read or write its
+  memory, inject anything, send it input or console commands, edit its files or launch options, or
+  close it. The only contact allowed is the process name list from `CreateToolhelp32Snapshot` and a
+  shared read of `console.log`. Everything else happens in the firewall, outside the game.
 - **State:** the active pick lives in WFP, not in memory or on disk. It's recovered from the stamp.
   Only settings and a capped log go to disk, in the local app data folder under `dl-conn-rs`.
 - **Failure:** bad data or a failed fetch never lifts a block or shrinks the relay set.
@@ -125,6 +129,13 @@ running. `scripts/live-test.ps1` uses real filters and needs a UAC prompt.
   `[string]` P/Invoke becomes `""`. Use `[NullString]::Value`.
 
 **egui**
+- winit never sends `Occluded` on Windows, and eframe isn't told about display or work-area changes.
+  A hidden window in `ui/mod.rs` hears `WM_DISPLAYCHANGE` and `WM_SETTINGCHANGE` and asks for a few
+  redraws. It was added for a report of a shifted frame with a white strip after a fullscreen game
+  started, fixed by moving the window. Covering the window with a borderless fullscreen form didn't
+  reproduce it, so the cause is unconfirmed.
+- `egui_kittest` renders use egui's default panel colour, not the palette. Check colours in the real
+  window.
 - Egui takes focus away on Esc before widgets run, unless `set_focus_lock_filter` keeps it.
 - A blinking caret and `request_repaint` in a loop both keep the window drawing. Keep `text_cursor.blink`
   off. `an_idle_window_stops_repainting_on_every_page` catches the rest.
@@ -143,6 +154,9 @@ running. `scripts/live-test.ps1` uses real filters and needs a UAC prompt.
   three sets. Its `max-age` is up to 300 s, so faster polling sees nothing new.
 
 **Game log**
+- A game running with `-condebug` went 60 s without a line on 11/15, so a quiet log proves nothing.
+  A launch without `-condebug` leaves the last launch's file in place. The monitor counts the log as
+  written only once it changes after the game is seen, and as silent after 3 minutes without that.
 - `console.log` needs `-condebug`, is rewritten on each launch, and is locked while the game runs,
   so open it with shared read access. `connection_log_27015.txt` covers Steam login servers, not
   relays.
@@ -150,13 +164,38 @@ running. `scripts/live-test.ps1` uses real filters and needs a UAC prompt.
   block, only the pick has one, and the rest appear as `code=/ms+penalty`.
 - `[Networking] Summary of connection` blocks hold each connection's loss, jitter and ping
   percentiles. The first set is this PC's. A second set, "received from remote host", is the far end's.
-- Hideout connections are `UDP` to `127.0.0.1` or `pipe`. A private lobby ready-up was followed by an
-  `SDR` connection in the one log checked, so custom games appear to use relays.
+- A solo hideout is `UDP` to `127.0.0.1` or `pipe`. A hideout lobby uses relays like a match: its
+  ticket line ends `hideout_lobby=`, and a match's ends `match_id=`, then an `SDR` connection
+  follows. A private lobby ready-up was followed by an `SDR` connection in the one log checked, so
+  custom games appear to use relays.
+- The game measures relay pings once, at startup. On 11/13 it measured once in a 3 h session. On
+  11/14, after a switch from sgp to hkg, it didn't measure again for 11 minutes, through a queue
+  and a hideout reload. So a switch reaches matchmaking only after the game restarts.
+- Deadlock ships its own `game\bin\win64\steamnetworkingsockets.dll`, so relay pinging happens in
+  the game, not in Steam. Restarting Steam never helps.
+- Restarting only the game is enough, and ExitLag can stay connected. On 11/15 sgp was picked with
+  the game closed. Its startup measurement then had `sgp=121+12` as the only direct entry, boosted as
+  before (119 ms the night before), and a real match ran 40 minutes on `sgp#98` at 122 ms.
+- Private lobby placement ignores the ping table. On 11/15 under a strict hkg block, with only hkg
+  measured, a custom game was hosted in `jnb` and failed twice with `Problems with 6 relays (1 OK)`,
+  `LOCALPROBLEM_MANYRELAYS`. The next lobby went to `sgp` and connected through `hkg#345`. So a
+  strict block can make a custom game unreachable. hkg measured 360 ms that session, most likely
+  because ExitLag was still set to Singapore.
 
 ## Open items
 
 - `hold_in_game` is unit tested only. It needs a relay list change while a game runs.
+- A mid-match pick waits for the match to end, but no pick has been made in a real match yet.
+  Replaying the 11/15 match log through `LogTail` gave `InMatch` at the connect and `LastMatch` at
+  the `closed` line, so detection works. Confirm that the match isn't cut and the pick applies then.
+- Untested: what a stale ping table costs. Nobody has accepted a match after a switch without a
+  restart.
+- Under an hkg block on 11/14, a P2P connect to `185.25.182.20:3478` failed with `WSAENETUNREACH`
+  and timed out. Check whether blocks break party hideout lobbies.
 - The route counter hasn't been seen against a live boosted match yet.
+- `No log` on Connection Hold is unit tested only. Check it with a launch without `-condebug`.
+- The redraw on a display change is checked only by posting `WM_DISPLAYCHANGE` to the listener.
+  Confirm the fullscreen glitch is gone with the game.
 - `--backup` is written and unit tested, but not yet confirmed against the game.
 - In a match under a strict Singapore block, the game ran 7 minutes with no backup, then logged
   `Selecting tyo#172 as backup #1` at 18:53:54, 8 s before the player left. Most likely the block

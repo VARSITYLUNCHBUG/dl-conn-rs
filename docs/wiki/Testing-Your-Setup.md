@@ -20,9 +20,9 @@ The game rewrites it each time it starts, so copy it first if you want to keep o
 
 ## 2. Pick your server first
 
-1. Close the game.
-2. Choose your server in the dl-conn-rs dropdown.
-3. Start the game.
+1. Choose your server in the dl-conn-rs dropdown.
+2. Start the game, or restart it if it's running. Steam can stay open.
+3. Check that the **Connection Hold** chip says `Ready`.
 
 ## 3. Test in a custom game
 
@@ -30,7 +30,10 @@ The game rewrites it each time it starts, so copy it first if you want to keep o
 2. Once you're in the match, stay connected for at least 2 minutes.
 3. Leave the match.
 
-The hideout doesn't count. It runs on your own PC, so it uses no relay.
+A solo hideout doesn't count. It runs on your own PC, so it uses no relay.
+
+A private lobby can be hosted on a server you blocked, and then it fails to connect. If that
+happens, leave and create the lobby again.
 
 ## 4. Read the report
 
@@ -77,11 +80,12 @@ about the route.
 
 When the custom game passes, play a real match and press F3 afterwards.
 
-## 6. Turn logging off
+## 6. Leave logging on
 
-Remove `-condebug -lognetapi` from Launch Options when you're done. The log grows by several
-hundred KB every few minutes. Blocking works without these options. Only the report and the Game
-counter need them.
+Keep the launch options. **Connection Hold** reads the game's log to see when you're in a match, so
+a pick made mid-match waits instead of cutting it. Without the log, a pick applies at once, even
+mid-match, and the chip says `No log`. The game starts its log again on each launch, so the file
+only holds the current session. Blocking works without the log.
 
 ## Checking the block directly
 

@@ -8,7 +8,7 @@ use super::theme;
 use crate::log;
 use crate::session::{Handle, Host, Output, Reply, Server, Status};
 use crate::settings::Row;
-use eframe::egui::{self, Context, Key, Modifiers, RichText, Ui, ViewportCommand};
+use eframe::egui::{self, Context, Key, Modifiers, Ui, ViewportCommand};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -32,7 +32,6 @@ const TABS: [(Page, &str); 5] = [
 ];
 
 const DRAW_HIDDEN_OVERRIDE: &str = "DL_CONN_RS_DRAW_HIDDEN";
-const THEMES: [(&str, &str); 3] = [("system", "System"), ("light", "Light"), ("dark", "Dark")];
 
 /// Everything the top of the window and the status page show, from one round of queries.
 #[derive(Debug, PartialEq)]
@@ -301,24 +300,6 @@ impl App {
                     self.open(page);
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let current = THEMES
-                    .iter()
-                    .find(|(value, _)| *value == self.theme)
-                    .map_or("System", |(_, label)| *label);
-                let shown = egui::ComboBox::from_id_salt("theme")
-                    .selected_text(current)
-                    .width(84.0)
-                    .show_ui(ui, |ui| {
-                        for (value, label) in THEMES {
-                            if ui.selectable_label(self.theme == value, label).clicked() {
-                                self.run(&format!("set config theme {value}"));
-                            }
-                        }
-                    });
-                let name = ui.label("Theme");
-                shown.response.labelled_by(name.id);
-            });
         });
     }
 
@@ -329,8 +310,7 @@ impl App {
         }
         ui.add_space(4.0);
         if let Some(data) = &self.data {
-            ui.label(RichText::new(&data.view.direct));
-            ui.label(RichText::new(&data.view.route));
+            pages::chips(ui, &data.view.chips);
         }
         ui.add_space(4.0);
         self.tabs(ui);
@@ -455,7 +435,7 @@ fn view_loop(session: &Handle, changes: &Receiver<()>, updates: &Sender<Update>,
             let view = rows::build_view(&servers, &status);
             let data = ViewData {
                 servers,
-                status,
+                status: *status,
                 config,
                 view,
             };

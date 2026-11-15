@@ -36,16 +36,26 @@ The exe is not code signed, so Windows may show "Unknown publisher" or a SmartSc
 
 ## Quick start
 
-1. Close the game.
-2. Run `dl-conn-rs.exe` and accept the admin prompt.
-3. Choose a server from the dropdown. Type to search by city, code or region, then press Enter.
-4. Start the game.
+1. Run `dl-conn-rs.exe` and accept the admin prompt.
+2. Choose a server from the dropdown. Type to search by city, code or region, then press Enter.
+3. Start the game. If it's already running, the **Connection Hold** chip under the dropdown says
+   whether it needs a restart.
 
 The title bar shows the active pick. Choose **No block** to remove it. Closing the app leaves the
 block on, and reopening the app picks up where you left off.
 
-Pick before the game starts. A block can't move a game that is already connected to a relay you
-left open.
+## Switching servers
+
+You can pick a new server at any time, and the block changes at once. The game measures relay
+pings only when it starts, though, and matchmaking uses that measurement. So the game only sees
+a new pick after it restarts. The **Connection Hold** chip says when that's needed, and when the game
+has measured your pick. It reads the game's log, so keep `-condebug` in the game's launch options.
+
+- Only the game needs restarting. Steam can stay open, because the game does its own relay
+  pinging.
+- A pick made during a match waits for the match to end, so the switch doesn't cut it.
+  `clear pending` cancels the wait, and `set pick <server> --now` doesn't wait.
+- With ExitLag, choose the same server in ExitLag too.
 
 Don't run another server picker at the same time. Its firewall rules still apply and can block the
 server you picked.
@@ -62,12 +72,17 @@ server you picked.
 
 Keys work while the window has focus. They are not global hotkeys.
 
-## Counters
+## Status chips
+
+The chips under the dropdown show a short value. Hover one for what it means.
 
 - **Direct:** a ping from this PC to your pick. The game's real path can differ, especially through
   a routing tool, so this is not your in-game ping.
-- **Game:** the last figure the game wrote to its log, with its time. It is not live. It needs
-  `-condebug` in the game's launch options. It reads **ExitLag route** while ExitLag is running.
+- **Game:** the last figure the game wrote to its log. It is not live. It needs `-condebug` in the
+  game's launch options. It reads **ExitLag** while ExitLag is running.
+- **Connection Hold:** `In match` while a pick would wait for the match to end, `Ready` once the
+  game has measured your pick, `Restart game` when it measured before the pick, and `No log` when
+  the game isn't writing its log. Without the log a pick applies at once, even mid-match.
 
 ## Backup relay
 
@@ -88,7 +103,7 @@ Press **F2**, or use `set config <key> <value>` in the console.
 | `report_every` | `1` to `3600` s | `5` | Console report interval |
 | `report_on_open` | `on`, `off` | `on` | Start the report when the console opens |
 | `clear_on_exit` | `on`, `off` | `off` | Remove the block when the app closes |
-| `theme` | `system`, `light`, `dark` | `system` | Window theme |
+| `theme` | `dark`, `light`, `system` | `system` | Dark is Dracula, Light is Catppuccin Latte, System follows Windows |
 | `log_path` | `auto` or a path | `auto` | Game log to read. `auto` finds Deadlock's |
 
 ## Files and removal

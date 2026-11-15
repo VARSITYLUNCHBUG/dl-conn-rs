@@ -1,6 +1,6 @@
 //! What the main window shows, worked out without touching Windows.
 
-use crate::monitor;
+use crate::monitor::Chip;
 use crate::regions;
 use crate::session::{Server, Status};
 
@@ -33,8 +33,8 @@ pub struct View {
     pub rows: Vec<Row>,
     pub selected: Option<usize>,
     pub title: String,
-    pub direct: String,
-    pub route: String,
+    /// The counters and the hold, each a short value with an explanation on hover.
+    pub chips: Vec<Chip>,
 }
 
 /// Whether every word typed appears in the label or the region, so "asia sing" finds Singapore.
@@ -128,8 +128,7 @@ pub fn build_view(servers: &[Server], status: &Status) -> View {
         selected: position(&rows, &status.pick),
         rows,
         title: title(status),
-        direct: monitor::direct_label(&status.pick, &status.monitor),
-        route: monitor::route_label(&status.pick, &status.monitor),
+        chips: status.chips(),
     }
 }
 
@@ -160,6 +159,7 @@ pub fn title(status: &Status) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::GameView;
     use crate::monitor::{Direct, Monitor};
 
     fn server(code: &str, desc: &str) -> Server {
@@ -181,6 +181,8 @@ mod tests {
             offline: false,
             error: None,
             monitor: Monitor::default(),
+            pending: None,
+            view: GameView::Unknown,
         }
     }
 
@@ -362,8 +364,19 @@ mod tests {
                 ..status()
             },
         );
-        assert_eq!(view.direct, "Direct: 180 ms to jnb (ping from this PC)");
-        assert_eq!(view.route, "Game: turn on logging to see this, press F1");
+        let chips: Vec<(&str, &str)> = view
+            .chips
+            .iter()
+            .map(|chip| (chip.name, chip.value.as_str()))
+            .collect();
+        assert_eq!(
+            chips,
+            [
+                ("Direct", "180 ms"),
+                ("Game", "No log"),
+                ("Connection Hold", "No log")
+            ]
+        );
     }
 
     #[test]
