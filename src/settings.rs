@@ -84,8 +84,8 @@ const KEYS: &[Key] = &[
         name: "theme",
         title: "Theme",
         kind: Kind::Theme,
-        allowed: "system, light or dark",
-        about: "How the window looks. system follows your Windows setting.",
+        allowed: "dark, light or system",
+        about: "How the window looks. Dark is Dracula, Light is Catppuccin Latte, and System follows Windows.",
     },
     Key {
         name: "log_path",
@@ -211,7 +211,7 @@ impl Settings {
                 let theme = value.to_lowercase();
                 if !["system", "light", "dark"].contains(&theme.as_str()) {
                     return Err(format!(
-                        "theme must be system, light or dark, not '{value}'"
+                        "theme must be dark, light or system, not '{value}'"
                     ));
                 }
                 self.theme = theme;
@@ -375,7 +375,7 @@ mod tests {
             ("report_every", "0", "1 to 3600"),
             ("report_on_open", "maybe", "on or off"),
             ("hold_in_game", "1", "on or off"),
-            ("theme", "blue", "system, light or dark"),
+            ("theme", "blue", "dark, light or system"),
             ("clear_on_exit", "", "on or off"),
             ("backup", "two words", "none or a server"),
             ("log_path", "\"\"", "auto or a file path"),

@@ -292,7 +292,11 @@ impl SettingsPage {
     ) -> Option<String> {
         match row.kind {
             Kind::Toggle => choice_box(ui, row, &choices(&["on", "off"]), label),
-            Kind::Theme => choice_box(ui, row, &choices(&["system", "light", "dark"]), label),
+            Kind::Theme => {
+                let themes = [("dark", "Dark"), ("light", "Light"), ("system", "System")]
+                    .map(|(value, name)| (value.to_string(), name.to_string()));
+                choice_box(ui, row, &themes, label)
+            }
             Kind::Server => choice_box(ui, row, &server_choices(&row.value, servers), label),
             Kind::Number | Kind::Path => {
                 let text = self

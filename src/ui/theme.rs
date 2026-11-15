@@ -22,34 +22,37 @@ pub struct Palette {
     pub note: Color32,
 }
 
+/// Dracula. Muted text is a lighter shade of its comment colour, which is too dim for small text.
 const DARK: Palette = Palette {
-    page: Color32::from_rgb(24, 26, 31),
-    surface: Color32::from_rgb(32, 35, 41),
-    raised: Color32::from_rgb(42, 46, 54),
-    border: Color32::from_rgb(62, 67, 77),
-    text: Color32::from_rgb(232, 234, 238),
-    muted: Color32::from_rgb(160, 166, 177),
-    accent: Color32::from_rgb(77, 141, 245),
-    on_accent: Color32::WHITE,
-    hover: Color32::from_rgb(50, 55, 65),
-    ok: Color32::from_rgb(90, 200, 130),
-    check: Color32::from_rgb(240, 180, 80),
-    note: Color32::from_rgb(120, 175, 245),
+    page: Color32::from_rgb(40, 42, 54),
+    surface: Color32::from_rgb(33, 34, 44),
+    raised: Color32::from_rgb(52, 55, 70),
+    border: Color32::from_rgb(68, 71, 90),
+    text: Color32::from_rgb(248, 248, 242),
+    muted: Color32::from_rgb(150, 160, 200),
+    accent: Color32::from_rgb(189, 147, 249),
+    on_accent: Color32::from_rgb(40, 42, 54),
+    hover: Color32::from_rgb(68, 71, 90),
+    ok: Color32::from_rgb(80, 250, 123),
+    check: Color32::from_rgb(255, 184, 108),
+    note: Color32::from_rgb(139, 233, 253),
 };
 
+/// Catppuccin Latte. Green, peach and blue are darker shades of its own, so they stay readable as
+/// text on its light base.
 const LIGHT: Palette = Palette {
-    page: Color32::from_rgb(246, 247, 249),
-    surface: Color32::from_rgb(255, 255, 255),
-    raised: Color32::from_rgb(236, 238, 242),
-    border: Color32::from_rgb(205, 209, 216),
-    text: Color32::from_rgb(28, 31, 36),
-    muted: Color32::from_rgb(88, 94, 105),
-    accent: Color32::from_rgb(28, 100, 216),
+    page: Color32::from_rgb(239, 241, 245),
+    surface: Color32::from_rgb(230, 233, 239),
+    raised: Color32::from_rgb(220, 224, 232),
+    border: Color32::from_rgb(188, 192, 204),
+    text: Color32::from_rgb(76, 79, 105),
+    muted: Color32::from_rgb(92, 95, 119),
+    accent: Color32::from_rgb(30, 102, 245),
     on_accent: Color32::WHITE,
-    hover: Color32::from_rgb(228, 232, 238),
-    ok: Color32::from_rgb(20, 120, 65),
-    check: Color32::from_rgb(160, 90, 0),
-    note: Color32::from_rgb(25, 90, 190),
+    hover: Color32::from_rgb(204, 208, 218),
+    ok: Color32::from_rgb(44, 112, 30),
+    check: Color32::from_rgb(172, 66, 6),
+    note: Color32::from_rgb(24, 82, 200),
 };
 
 pub fn palette(dark: bool) -> Palette {
