@@ -15,8 +15,9 @@ pick, relay latency and routes, and any traffic stopped by the block. Use `stop 
 | `list servers [--filter <text>]` | List relay sites you can pick |
 | `list relays [<server>]` | List relay addresses, for all sites or one |
 | `show status` | Show the pick, what's blocked and connection state |
-| `set pick <server> [--backup <server>]` | Block every relay except this server's |
+| `set pick <server> [--backup <server>] [--now]` | Block every relay except this server's. Mid-match, waits for the match to end |
 | `clear pick` | Remove the block so all servers are open |
+| `clear pending` | Drop a pick that's waiting for the match to end |
 | `refresh relays` | Fetch relay lists from Steam now |
 | `show routes [<server>]` | Show the interface and gateway to each relay |
 | `ping relays [<server>]` | Measure latency to each relay |

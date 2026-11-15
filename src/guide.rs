@@ -38,16 +38,21 @@ The game rewrites this file every time it starts. Copy it first if you want to
 keep one. To read a different game's log, set its path in F2.
 
 
-STEP 2: PICK YOUR SERVER FIRST
+STEP 2: PICK YOUR SERVER
 
-  1. Close the game if it's running.
-  2. Choose your server in the dl-conn-rs dropdown. Type to search by city, code
+  1. Choose your server in the dl-conn-rs dropdown. Type to search by city, code
      or region.
-  3. Start the game.
+  2. Start the game. If it's already running, look at Connection Hold under
+     the dropdown. Restart game means restart only the game. Steam can stay
+     open.
 
-Pick before the game starts, so the ping measurement it runs at startup already
-sees the block. A block can't move a game that's already connected to a relay
-you left open.
+The game measures relay pings only when it starts, and matchmaking uses that
+measurement. The block changes at once, but the game only sees a new pick after
+it restarts. Restarting Steam doesn't help, because the game does its own relay
+pinging.
+
+A pick made during a match waits for the match to end, so the switch doesn't cut
+it. 'clear pending' cancels the wait. 'set pick <server> --now' doesn't wait.
 
 
 STEP 3: TEST IN A CUSTOM GAME
@@ -58,8 +63,11 @@ A custom game puts no match at risk, so use it to prove the setup first.
   2. Wait until you're in the match, then stay connected for at least 2 minutes.
   3. Leave the match.
 
-The hideout doesn't count. It runs on your own PC, so it uses no relay and tells
-you nothing about the route.
+A solo hideout doesn't count. It runs on your own PC, so it uses no relay and
+tells you nothing about the route.
+
+A private lobby can be hosted on a server you blocked, and then it fails to
+connect. If that happens, leave and create the lobby again.
 
 
 STEP 4: READ THE REPORT
@@ -106,14 +114,18 @@ When the custom game passes, play a real match and press F3 again afterwards.
 The report covers each connection in the log.
 
 
-STEP 6: TURN LOGGING OFF
+STEP 6: LEAVE LOGGING ON
 
-Remove -condebug and -lognetapi from Launch Options when you're finished. The
-log grew by about 434 KB in 5 minutes in testing. You don't need these options
-for blocking to work, only for the report and the route counter.
+Keep the launch options from step 1. Connection Hold reads the game's log to
+see when you're in a match, so a pick made mid-match waits instead of cutting
+it. Without the log, a pick applies at once, even mid-match, and Connection
+Hold says No log. The game starts its log again each time it launches, so the
+file only ever holds the current session. Blocking works without the log.
 
 
-WHAT THE TWO COUNTERS MEASURE
+WHAT THE STATUS CHIPS SHOW
+
+The chips sit under the dropdown. Hover one to see what its value means.
 
 Direct
     A ping from this PC straight to your pick. A game's real path can differ, so
@@ -124,6 +136,13 @@ Game
     It's the last known value and it isn't live, because the game only logs it
     when it measures or connects. It needs the launch options from step 1.
 
+Connection Hold
+    In match      A pick that closes this match's server waits for it to end.
+    Ready         The game measured your pick and no blocked server.
+    Restart game  The game measured before this pick. Restart only the game.
+    Next launch   The game will measure your pick when it starts.
+    No log        The game isn't writing its log, so a pick applies at once.
+
 
 IF YOU USE EXITLAG
 
@@ -131,8 +150,8 @@ You don't need ExitLag to use dl-conn-rs. If you do use it:
 
   1. Choose the same server in ExitLag as in dl-conn-rs. A block can't change
      where ExitLag routes.
-  2. The second counter is labelled ExitLag route while ExitLag is running. A
-     running ExitLag doesn't prove that the game was boosted at that moment.
+  2. The Game chip is labelled ExitLag while ExitLag is running. A running
+     ExitLag doesn't prove that the game was boosted at that moment.
   3. Direct doesn't go through ExitLag, so the two can differ a lot.
   4. If the report says the route looks slower than direct, try another route or
      server in ExitLag.
@@ -171,7 +190,7 @@ mod tests {
         assert!(at("PICK YOUR SERVER") < at("CUSTOM GAME\n"));
         assert!(at("CUSTOM GAME\n") < at("READ THE REPORT"));
         assert!(at("READ THE REPORT") < at("REAL MATCH"));
-        assert!(at("REAL MATCH") < at("TURN LOGGING OFF"));
+        assert!(at("REAL MATCH") < at("LEAVE LOGGING ON"));
         assert!(text.contains("-condebug -lognetapi"));
     }
 

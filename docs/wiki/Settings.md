@@ -15,7 +15,7 @@ defaults and never changes a block.
 | `report_every` | `1` to `3600` s | `5` | Console report interval |
 | `report_on_open` | `on`, `off` | `on` | Start the report when the console opens |
 | `clear_on_exit` | `on`, `off` | `off` | Remove the block when the app closes |
-| `theme` | `system`, `light`, `dark` | `system` | How the window looks |
+| `theme` | `dark`, `light`, `system` | `system` | Dark is Dracula, Light is Catppuccin Latte, System follows Windows |
 | `log_path` | `auto` or a path | `auto` | The game log to read. `auto` finds Deadlock's. Other games are untested |
 
 No setting lowers ping beyond choosing a route.
