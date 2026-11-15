@@ -10,6 +10,8 @@ use crate::regions;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RouteState {
     InMatch,
+    /// Connected through relays to a hideout lobby, which isn't a match.
+    InLobby,
     LastMatch,
     Measured,
 }
@@ -590,13 +592,60 @@ pub fn parse(text: &str) -> Log {
     log
 }
 
+/// Whether the game's ping table matches the block, which decides what matchmaking is told.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GameView {
+    /// No table yet: no log, or the game hasn't measured since it started.
+    Unknown,
+    /// The pick is measured directly and no blocked site is.
+    Ready { ms: u32 },
+    /// The game measured before this pick, so it needs a restart to measure again.
+    Stale,
+}
+
+/// Compares the game's last `Ping location` table with the open sites, the pick first. The game
+/// measures only at startup, so a table that doesn't match the block stays that way.
+pub fn game_view(table: &[PingEntry], open: &[&str]) -> GameView {
+    let Some(pick) = open.first() else {
+        return GameView::Unknown;
+    };
+    if table.is_empty() {
+        return GameView::Unknown;
+    }
+    let blocked_measured = table
+        .iter()
+        .any(|entry| entry.direct.is_some() && !open.contains(&entry.site.as_str()));
+    let pick_ms = table
+        .iter()
+        .find(|entry| entry.site == *pick)
+        .and_then(|entry| entry.direct);
+    match pick_ms {
+        Some(ms) if !blocked_measured => GameView::Ready { ms },
+        _ => GameView::Stale,
+    }
+}
+
+/// The relay connection the game has open.
+#[derive(Debug, Clone)]
+struct Open {
+    id: String,
+    site: String,
+    ms: u32,
+    at: String,
+    /// False only when its ticket said `hideout_lobby=`. A connection whose ticket wasn't seen
+    /// counts as a match, so that nothing ever cuts one by mistake.
+    is_match: bool,
+}
+
 /// Follows a growing log for the route counter, keeping only what the counter needs.
 #[derive(Debug, Clone, Default)]
 pub struct LiveRoute {
-    open: Option<(String, String, u32, String)>,
+    open: Option<Open>,
     closed: Option<Route>,
     table: Vec<PingEntry>,
     table_at: String,
+    /// Whether the last ticket was for a hideout lobby rather than a match.
+    lobby_ticket: Option<bool>,
 }
 
 impl LiveRoute {
@@ -613,20 +662,26 @@ impl LiveRoute {
             }
             if let Some(selected) = parse_selected(stamp, line.body) {
                 if selected.backup.is_none() {
-                    self.open = Some((
-                        line.id.to_string(),
-                        selected.site().to_string(),
-                        selected.ping,
-                        minutes(stamp).to_string(),
-                    ));
+                    let is_match = match &self.open {
+                        Some(open) if open.id == line.id => open.is_match,
+                        _ => self.lobby_ticket.take() != Some(true),
+                    };
+                    self.open = Some(Open {
+                        id: line.id.to_string(),
+                        site: selected.site().to_string(),
+                        ms: selected.ping,
+                        at: minutes(stamp).to_string(),
+                        is_match,
+                    });
                 }
             } else if is_closed(line.body)
-                && self.open.as_ref().is_some_and(|open| open.0 == line.id)
-                && let Some((_, site, ms, _)) = self.open.take()
+                && self.open.as_ref().is_some_and(|open| open.id == line.id)
+                && let Some(open) = self.open.take()
+                && open.is_match
             {
                 self.closed = Some(Route {
-                    site,
-                    ms,
+                    site: open.site,
+                    ms: open.ms,
                     at: minutes(stamp).to_string(),
                     state: RouteState::LastMatch,
                 });
@@ -634,18 +689,33 @@ impl LiveRoute {
         } else if let Some(rest) = text.strip_prefix("Ping location:") {
             self.table = parse_location(rest);
             self.table_at = stamp.to_string();
+        } else if let Some(rest) = text.strip_prefix("Received Steam datagram ticket") {
+            if rest.contains("hideout_lobby=") {
+                self.lobby_ticket = Some(true);
+            } else if rest.contains("match_id=") {
+                self.lobby_ticket = Some(false);
+            }
         }
+    }
+
+    /// The game's last `Ping location` table, empty until it has measured.
+    pub fn table(&self) -> &[PingEntry] {
+        &self.table
     }
 
     /// The best figure for the pick: the open connection, then whichever of the last measurement
     /// and the last connection is newer.
     pub fn current(&self, pick: &str) -> Option<Route> {
-        if let Some((_, site, ms, at)) = &self.open {
+        if let Some(open) = &self.open {
             return Some(Route {
-                site: site.clone(),
-                ms: *ms,
-                at: at.clone(),
-                state: RouteState::InMatch,
+                site: open.site.clone(),
+                ms: open.ms,
+                at: open.at.clone(),
+                state: if open.is_match {
+                    RouteState::InMatch
+                } else {
+                    RouteState::InLobby
+                },
             });
         }
         let measured = self
@@ -1741,6 +1811,76 @@ mod tests {
         route.feed("11/05 19:10:00 [SteamNetSockets] Ping location: sgp=99+12/100+12");
         let now = route.current("sgp").unwrap();
         assert_eq!((now.ms, now.state), (99, RouteState::Measured));
+    }
+
+    /// Lines from the 11/13 log: a hideout lobby connection, then a match, with IDs replaced.
+    const LOBBY_THEN_MATCH: &str = "11/13 19:59:03 [SteamNetSockets] Received Steam datagram ticket for server steamid:1 vport -1. hideout_lobby=174222235601768963
+11/13 19:59:10 [SteamNetSockets] [#2 SDR server steamid:1 vport 0] Requesting session from jnb#12 (155.133.238.178:27026).  Ping = 4 = 4+0 (front+back).  Rank=1 Score=14
+11/13 19:59:10 [SteamNetSockets] [#2 SDR server steamid:1 vport 0] Selecting jnb#12 (155.133.238.178:27026) as primary.  (Ping = 4 = 4+0+0 (front+interior+remote).  Rank=1 Score=4)
+11/13 19:59:10 [SteamNetSockets] [#2 SDR server steamid:1 vport 0] connected
+11/13 19:59:11 [SteamNetSockets] [#2 SDR server steamid:1 vport 0 'server'] Selecting lhr#178 (162.254.196.85:27054) as backup #1 (Ping = 336 = 168+168+0 (front+interior+remote).  Rank=2 Score=352)
+11/13 20:03:19 [SteamNetSockets] Received Steam datagram ticket for server steamid:1 vport -1. match_id=136752490
+11/13 20:03:19 [SteamNetSockets] [#2 SDR server steamid:1 vport 0 'server'] closed by peer (1001): NETWORK_DISCONNECT_SHUTDOWN
+11/13 20:03:20 [SteamNetSockets] [#3 SDR server steamid:1 vport 0] Selecting jnb#12 (155.133.238.178:27026) as primary.  (Ping = 4 = 4+0+0 (front+interior+remote).  Rank=1 Score=4)
+11/13 20:03:20 [SteamNetSockets] [#3 SDR server steamid:1 vport 0] connected
+";
+
+    #[test]
+    fn a_hideout_lobby_is_not_a_match() {
+        let mut route = LiveRoute::default();
+        let lines: Vec<&str> = LOBBY_THEN_MATCH.lines().collect();
+        for line in &lines[..5] {
+            route.feed(line);
+        }
+        let lobby = route.current("jnb").unwrap();
+        assert_eq!(lobby.state, RouteState::InLobby);
+        assert_eq!(lobby.site, "jnb", "a backup doesn't replace the primary");
+
+        route.feed(lines[5]);
+        route.feed(lines[6]);
+        assert_eq!(
+            route.current("jnb"),
+            None,
+            "a closed lobby isn't a last match"
+        );
+        route.feed(lines[7]);
+        assert_eq!(route.current("jnb").unwrap().state, RouteState::InMatch);
+    }
+
+    #[test]
+    fn a_connection_without_a_ticket_counts_as_a_match() {
+        let mut route = LiveRoute::default();
+        route.feed("11/05 18:46:43 [SteamNetSockets] [#1 SDR server vport 0] Selecting sgp#1 (1.1.1.1:1) as primary.  (Ping = 121 = 120+1+0 (front+interior+remote).  Rank=1 Score=1)");
+        assert_eq!(route.current("sgp").unwrap().state, RouteState::InMatch);
+    }
+
+    fn table(text: &str) -> Vec<PingEntry> {
+        parse_location(text)
+    }
+
+    #[test]
+    fn the_game_view_follows_the_block() {
+        // The 11/14 table: measured under a strict sgp block, then hkg was picked.
+        let measured =
+            table("sgp=119+11/120+11,maa2=/151+11,hkg=/152+11,tyo=/201+11,syd=/211+11,ams=/323+11");
+        assert_eq!(game_view(&measured, &["sgp"]), GameView::Ready { ms: 119 });
+        assert_eq!(game_view(&measured, &["hkg"]), GameView::Stale);
+        assert_eq!(
+            game_view(&measured, &["hkg", "sgp"]),
+            GameView::Stale,
+            "the pick itself has no direct figure"
+        );
+        assert_eq!(
+            game_view(&measured, &["sgp", "hkg"]),
+            GameView::Ready { ms: 119 }
+        );
+
+        // The 11/13 table: measured with nothing blocked, so other sites are measured too.
+        let open = table("jnb=3+0,dfra=164+16,ams=197+19/165+0,lhr=166+16/169+0,dlhr=/172+0");
+        assert_eq!(game_view(&open, &["jnb"]), GameView::Stale);
+
+        assert_eq!(game_view(&[], &["sgp"]), GameView::Unknown);
+        assert_eq!(game_view(&measured, &[]), GameView::Unknown);
     }
 
     #[test]

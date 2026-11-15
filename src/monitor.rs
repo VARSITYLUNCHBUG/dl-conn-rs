@@ -4,7 +4,7 @@
 //! measurement of this PC's path. The game's figure is the last one it wrote, and it's the only one
 //! that sees a routing tool such as ExitLag, if one is in use. Nothing here needs ExitLag or Steam.
 
-use crate::analysis::{LiveRoute, Route, RouteState};
+use crate::analysis::{GameView, LiveRoute, PingEntry, Route, RouteState};
 use crate::diag;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -24,6 +24,9 @@ const SEARCH_EVERY: Duration = Duration::from_secs(30);
 const MAX_FIRST_READ: u64 = 16 << 20;
 /// The last value holds for this many misses, because single ICMP failures are common here.
 const HOLD_MISSES: u32 = 2;
+/// How long a running game's log can stay unchanged before it counts as not being written. A logging
+/// game went 60 s without a line in testing, so this is well past that.
+const SILENT_AFTER: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum Direct {
@@ -37,57 +40,263 @@ pub enum Direct {
     NoReply,
 }
 
+/// Whether the game is writing its log. A launch without `-condebug` leaves the last launch's file
+/// in place, so a file that exists proves nothing until it changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GameLog {
+    #[default]
+    NoGame,
+    /// The game is running and the log hasn't changed since it was first seen.
+    Checking,
+    Writing,
+    /// Nothing written for `SILENT_AFTER`. The log can go a minute without a line, so it's longer.
+    Silent,
+}
+
+impl GameLog {
+    /// The next state, given whether the game runs, whether the log just changed, and how long the
+    /// game has been seen without a change.
+    fn next(self, game: bool, wrote: bool, waited: Duration) -> Self {
+        match (game, self) {
+            (false, _) => Self::NoGame,
+            (true, _) if wrote => Self::Writing,
+            (true, Self::Writing) => Self::Writing,
+            (true, _) if waited >= SILENT_AFTER => Self::Silent,
+            (true, _) => Self::Checking,
+        }
+    }
+}
+
 /// What the counters show.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Monitor {
     pub direct: Direct,
     pub exitlag: bool,
+    /// A game from `diag::GAMES` is running.
+    pub game: bool,
     pub log_found: bool,
+    /// Whether the running game is writing its log, which a match hold depends on.
+    pub game_log: GameLog,
     pub route: Option<Route>,
+    /// The game's last `Ping location` table, empty until it has measured.
+    pub table: Vec<PingEntry>,
 }
 
-/// The direct counter's text. ExitLag is only mentioned when it's running.
-pub fn direct_label(pick: &str, monitor: &Monitor) -> String {
-    match monitor.direct {
-        Direct::Off => "Direct: off, ping interval is 0".to_string(),
-        _ if pick.is_empty() => "Direct: pick a server".to_string(),
-        Direct::NoPick | Direct::Waiting => format!("Direct: measuring {pick}"),
-        Direct::Ms(ms) if monitor.exitlag => {
-            format!("Direct: {ms} ms to {pick} (this PC, not through ExitLag)")
+/// How a chip's value is coloured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Plain,
+    Good,
+    Warn,
+}
+
+/// One status chip: a name, a short value, and the explanation behind it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Chip {
+    pub name: &'static str,
+    pub value: String,
+    pub tip: String,
+    pub tone: Tone,
+}
+
+impl Chip {
+    fn new(name: &'static str, value: impl Into<String>, tip: impl Into<String>) -> Self {
+        Self {
+            name,
+            value: value.into(),
+            tip: tip.into(),
+            tone: Tone::Plain,
         }
-        Direct::Ms(ms) => format!("Direct: {ms} ms to {pick} (ping from this PC)"),
-        Direct::BlockedLocally => format!("Direct: {pick} blocked by a filter on this PC"),
-        Direct::NoReply => format!("Direct: no reply from {pick}"),
+    }
+
+    fn tone(self, tone: Tone) -> Self {
+        Self { tone, ..self }
+    }
+
+    /// The chip as one line, for the console and the log.
+    pub fn line(&self) -> String {
+        format!("{}: {}. {}", self.name, self.value, self.tip)
     }
 }
 
-/// The game's figure as text. It always says where it came from and when.
-pub fn route_label(pick: &str, monitor: &Monitor) -> String {
-    let name = if monitor.exitlag {
-        "ExitLag route"
-    } else {
-        "Game"
-    };
+pub const HOLD: &str = "Connection Hold";
+
+/// The site of the match the game is in, if the log shows one. A pick that would cut it waits.
+/// A log the game isn't writing could hold a match from an earlier launch, so it doesn't count.
+pub fn match_site(monitor: &Monitor) -> Option<&str> {
+    let route = monitor.route.as_ref()?;
+    (route.state == RouteState::InMatch && monitor.game && monitor.game_log != GameLog::Silent)
+        .then_some(route.site.as_str())
+}
+
+/// The direct counter. ExitLag is only mentioned when it's running.
+pub fn direct_chip(pick: &str, monitor: &Monitor) -> Option<Chip> {
+    let chip = |value: &str, tip: String| Some(Chip::new("Direct", value, tip));
+    match monitor.direct {
+        Direct::Off => chip(
+            "Off",
+            "Pinging is off because ping_every is 0. Change it in Settings (F2).".to_string(),
+        ),
+        _ if pick.is_empty() => None,
+        Direct::NoPick | Direct::Waiting => {
+            chip("Measuring", format!("Pinging {pick} from this PC."))
+        }
+        Direct::Ms(ms) if monitor.exitlag => chip(
+            &format!("{ms} ms"),
+            format!(
+                "Ping from this PC straight to {pick}, not through ExitLag. The game's ping can \
+                 differ a lot."
+            ),
+        ),
+        Direct::Ms(ms) => chip(
+            &format!("{ms} ms"),
+            format!("Ping from this PC straight to {pick}. The game's own path can differ."),
+        ),
+        Direct::BlockedLocally => chip(
+            "Blocked",
+            format!("A filter on this PC stopped the ping to {pick}."),
+        )
+        .map(|chip| chip.tone(Tone::Warn)),
+        Direct::NoReply => chip(
+            "No reply",
+            format!(
+                "{pick} didn't answer the last few pings. Single misses are common and don't mean \
+                 a block."
+            ),
+        )
+        .map(|chip| chip.tone(Tone::Warn)),
+    }
+}
+
+/// The game's own figure. It always says where it came from and when.
+pub fn route_chip(pick: &str, monitor: &Monitor) -> Chip {
+    let name = if monitor.exitlag { "ExitLag" } else { "Game" };
     if !monitor.log_found {
-        return format!("{name}: turn on logging to see this, press F1");
+        return Chip::new(
+            name,
+            "No log",
+            "Add -condebug to the game's launch options to see its ping. Press F1 for how.",
+        );
     }
     let Some(route) = &monitor.route else {
-        return format!("{name}: no game data yet, press F1");
+        return Chip::new(
+            name,
+            "No data",
+            "The game hasn't measured relays or connected yet.",
+        );
     };
     let when = match route.state {
-        RouteState::InMatch => "in match",
-        RouteState::LastMatch => "last match",
-        RouteState::Measured => "measured",
+        RouteState::InMatch => format!("in the match since {}", route.at),
+        RouteState::InLobby => format!("in a hideout lobby since {}", route.at),
+        RouteState::LastMatch => format!("in the last match, at {}", route.at),
+        RouteState::Measured => format!("measured at {}", route.at),
     };
-    let other = if !pick.is_empty() && route.site != pick {
-        ", not your pick"
+    let site = &route.site;
+    let other = !pick.is_empty() && *site != pick;
+    let through = if monitor.exitlag {
+        " through ExitLag, if it's boosting the game"
     } else {
         ""
     };
-    format!(
-        "{name}: {} ms to {}{other}, {when} at {} (game log, not live)",
-        route.ms, route.site, route.at
-    )
+    let mut tip = format!("The game's ping to {site}{through}, {when}.");
+    if other {
+        tip.push_str(&format!(" {site} isn't your pick."));
+    }
+    tip.push_str(" Read from the game's log, so it isn't live.");
+    let value = if other {
+        format!("{} ms {site}", route.ms)
+    } else {
+        format!("{} ms", route.ms)
+    };
+    let chip = Chip::new(name, value, tip);
+    if other { chip.tone(Tone::Warn) } else { chip }
+}
+
+/// What a switch still needs, or `None` when there's nothing to say. The game measures relays only
+/// at startup, so the pick reaches matchmaking only once a measurement has seen the block.
+pub fn hold_chip(
+    pick: &str,
+    pending: Option<&str>,
+    view: GameView,
+    monitor: &Monitor,
+) -> Option<Chip> {
+    let chip = |value: &str, tip: String| Some(Chip::new(HOLD, value, tip));
+    if let Some(pending) = pending {
+        return chip(
+            &format!("{pending} after match"),
+            format!(
+                "You picked {pending} during a match, so it waits for the match to end instead of \
+                 cutting it. 'clear pending' cancels it."
+            ),
+        )
+        .map(|chip| chip.tone(Tone::Warn));
+    }
+    if monitor.game && (!monitor.log_found || monitor.game_log == GameLog::Silent) {
+        return chip(
+            "No log",
+            "The game isn't writing console.log, so a match can't be seen and a pick applies at \
+             once, even mid-match. Add -condebug to the game's launch options (F1), then restart \
+             the game."
+                .to_string(),
+        )
+        .map(|chip| chip.tone(Tone::Warn));
+    }
+    if let Some(site) = match_site(monitor) {
+        return chip(
+            "In match",
+            format!(
+                "In a match on {site}. A pick that closes {site} waits for the match to end. \
+                 'set pick <server> --now' doesn't wait."
+            ),
+        )
+        .map(|chip| chip.tone(Tone::Good));
+    }
+    if !monitor.log_found {
+        return chip(
+            "No log",
+            "Add -condebug to the game's launch options (F1). Without its log, a pick can't wait \
+             for a match to end, and this can't say when the game needs a restart."
+                .to_string(),
+        );
+    }
+    if monitor.game_log == GameLog::Checking {
+        return chip(
+            "Checking",
+            "Waiting for the game to write its log.".to_string(),
+        );
+    }
+    if pick.is_empty() {
+        return None;
+    }
+    let stay_open = if monitor.exitlag {
+        "Steam and ExitLag can stay open."
+    } else {
+        "Steam can stay open."
+    };
+    match view {
+        GameView::Unknown if monitor.game => chip(
+            "Measuring",
+            "Waiting for the game to measure relays.".to_string(),
+        ),
+        GameView::Unknown => None,
+        GameView::Ready { ms } => chip(
+            "Ready",
+            format!("The game measured {pick} at {ms} ms and no blocked server."),
+        )
+        .map(|chip| chip.tone(Tone::Good)),
+        GameView::Stale if monitor.game => chip(
+            "Restart game",
+            format!(
+                "The game measured relays before {pick} was picked, and only measures when it \
+                 starts. Restart the game. {stay_open}"
+            ),
+        )
+        .map(|chip| chip.tone(Tone::Warn)),
+        GameView::Stale => chip(
+            "Next launch",
+            format!("The game will measure {pick} when it starts."),
+        ),
+    }
 }
 
 /// Turns ping results into what the counter shows.
@@ -156,6 +365,8 @@ struct LogTail {
     head: Vec<u8>,
     partial: Vec<u8>,
     route: LiveRoute,
+    /// The file changed since it was last read, not counting a first read.
+    wrote: bool,
 }
 
 impl LogTail {
@@ -197,6 +408,11 @@ impl LogTail {
         }
     }
 
+    /// Whether the file changed since this was last asked.
+    fn take_wrote(&mut self) -> bool {
+        std::mem::take(&mut self.wrote)
+    }
+
     /// Reads new lines. Returns whether a log was found.
     fn poll(&mut self, configured: Option<&str>) -> bool {
         let same_setting = self.configured.as_deref() == configured;
@@ -234,6 +450,7 @@ impl LogTail {
         if self.seen == now_seen {
             return Ok(());
         }
+        self.wrote |= self.seen.is_some();
         self.seen = now_seen;
         let mut file: File = diag::open_shared(path)?;
         let length = metadata.len();
@@ -280,12 +497,18 @@ fn run(
     let mut state = Monitor::default();
     let mut next_ping = Instant::now();
     let mut next_log = Instant::now();
+    let mut game_since: Option<Instant> = None;
     loop {
         let now = Instant::now();
         if now >= next_log {
-            state.exitlag = diag::exitlag_running();
+            (state.exitlag, state.game) = diag::exitlag_and_game_running();
             state.log_found = tail.poll(log_path.as_deref());
+            let wrote = tail.take_wrote();
+            game_since = state.game.then(|| game_since.unwrap_or(now));
+            let waited = game_since.map_or(Duration::ZERO, |since| now - since);
+            state.game_log = state.game_log.next(state.game, wrote, waited);
             state.route = tail.route.current(&pick);
+            state.table = tail.route.table().to_vec();
             next_log = now + LOG_EVERY;
         }
         if ping_every == 0 {
@@ -399,24 +622,34 @@ mod tests {
         }
     }
 
+    fn direct_value(pick: &str, monitor: &Monitor) -> Option<String> {
+        direct_chip(pick, monitor).map(|chip| chip.value)
+    }
+
     #[test]
-    fn direct_labels_say_what_they_measure() {
+    fn direct_chips_say_what_they_measure() {
+        let chip = direct_chip("sgp", &direct(Direct::Ms(356))).unwrap();
+        assert_eq!(chip.value, "356 ms");
+        assert!(chip.tip.contains("straight to sgp"), "{}", chip.tip);
+        assert_eq!(direct_value("", &direct(Direct::NoPick)), None);
+        assert_eq!(direct_value("sgp", &direct(Direct::Off)).unwrap(), "Off");
         assert_eq!(
-            direct_label("sgp", &direct(Direct::Ms(356))),
-            "Direct: 356 ms to sgp (ping from this PC)"
+            direct_value("sgp", &direct(Direct::NoReply)).unwrap(),
+            "No reply"
+        );
+        let blocked = direct_chip("sgp", &direct(Direct::BlockedLocally)).unwrap();
+        assert_eq!(
+            (blocked.value.as_str(), blocked.tone),
+            ("Blocked", Tone::Warn)
+        );
+        assert!(blocked.tip.contains("filter"));
+        assert_eq!(
+            direct_value("sgp", &direct(Direct::Waiting)).unwrap(),
+            "Measuring"
         );
         assert_eq!(
-            direct_label("", &direct(Direct::NoPick)),
-            "Direct: pick a server"
-        );
-        assert!(direct_label("sgp", &direct(Direct::Off)).contains("off"));
-        assert!(direct_label("sgp", &direct(Direct::NoReply)).contains("no reply from sgp"));
-        assert!(direct_label("sgp", &direct(Direct::BlockedLocally)).contains("filter"));
-        assert!(direct_label("sgp", &direct(Direct::Waiting)).contains("measuring"));
-        assert!(direct_label("sgp", &direct(Direct::NoPick)).contains("measuring"));
-        assert_eq!(
-            direct_label("", &direct(Direct::NoReply)),
-            "Direct: pick a server",
+            direct_value("", &direct(Direct::NoReply)),
+            None,
             "a figure from before the block was cleared isn't shown"
         );
     }
@@ -427,80 +660,234 @@ mod tests {
             exitlag: true,
             ..direct(Direct::Ms(356))
         };
-        assert_eq!(
-            direct_label("sgp", &with),
-            "Direct: 356 ms to sgp (this PC, not through ExitLag)"
+        assert!(
+            direct_chip("sgp", &with)
+                .unwrap()
+                .tip
+                .contains("not through ExitLag")
         );
+        assert_eq!(route_chip("sgp", &with).name, "ExitLag");
         for monitor in [
             Monitor::default(),
             direct(Direct::Ms(356)),
             Monitor {
                 log_found: true,
+                game: true,
                 route: Some(route(RouteState::InMatch, "sgp")),
                 ..direct(Direct::Ms(356))
             },
         ] {
-            assert!(!direct_label("sgp", &monitor).contains("ExitLag"));
-            assert!(!route_label("sgp", &monitor).contains("ExitLag"));
+            let chips = [
+                direct_chip("sgp", &monitor),
+                Some(route_chip("sgp", &monitor)),
+                hold_chip("sgp", None, GameView::Stale, &monitor),
+            ];
+            for chip in chips.into_iter().flatten() {
+                assert!(!chip.line().contains("ExitLag"), "{}", chip.line());
+            }
         }
     }
 
     #[test]
-    fn the_game_figure_shows_without_exitlag() {
-        let monitor = Monitor {
+    fn route_chips_give_the_figure_and_say_where_it_came_from() {
+        let game = Monitor {
             exitlag: false,
             ..running(Some(route(RouteState::InMatch, "sgp")))
         };
-        assert_eq!(
-            route_label("sgp", &monitor),
-            "Game: 121 ms to sgp, in match at 18:46 (game log, not live)"
+        let chip = route_chip("sgp", &game);
+        assert_eq!((chip.name, chip.value.as_str()), ("Game", "121 ms"));
+        assert!(
+            chip.tip.contains("in the match since 18:46"),
+            "{}",
+            chip.tip
         );
-    }
-
-    #[test]
-    fn route_labels_give_their_source_and_time() {
-        assert_eq!(
-            route_label("sgp", &running(Some(route(RouteState::InMatch, "sgp")))),
-            "ExitLag route: 121 ms to sgp, in match at 18:46 (game log, not live)"
-        );
-        assert_eq!(
-            route_label("sgp", &running(Some(route(RouteState::Measured, "sgp")))),
-            "ExitLag route: 121 ms to sgp, measured at 18:46 (game log, not live)"
-        );
-        assert_eq!(
-            route_label("sgp", &running(Some(route(RouteState::LastMatch, "sgp")))),
-            "ExitLag route: 121 ms to sgp, last match at 18:46 (game log, not live)"
-        );
+        assert!(chip.tip.contains("isn't live"));
+        for (state, when) in [
+            (RouteState::Measured, "measured at 18:46"),
+            (RouteState::LastMatch, "last match, at 18:46"),
+            (RouteState::InLobby, "hideout lobby since 18:46"),
+        ] {
+            let chip = route_chip("sgp", &running(Some(route(state, "sgp"))));
+            assert!(chip.tip.contains(when), "{}", chip.tip);
+        }
     }
 
     #[test]
     fn a_route_to_another_site_says_so() {
-        let label = route_label("fra", &running(Some(route(RouteState::InMatch, "sgp"))));
-        assert!(label.contains("to sgp, not your pick"), "{label}");
-        let label = route_label("", &running(Some(route(RouteState::InMatch, "sgp"))));
-        assert!(!label.contains("not your pick"), "{label}");
+        let chip = route_chip("fra", &running(Some(route(RouteState::InMatch, "sgp"))));
+        assert_eq!((chip.value.as_str(), chip.tone), ("121 ms sgp", Tone::Warn));
+        assert!(chip.tip.contains("sgp isn't your pick"), "{}", chip.tip);
+        let chip = route_chip("", &running(Some(route(RouteState::InMatch, "sgp"))));
+        assert_eq!((chip.value.as_str(), chip.tone), ("121 ms", Tone::Plain));
     }
 
     #[test]
-    fn labels_cover_having_nothing_to_show() {
+    fn route_chips_cover_having_nothing_to_show() {
+        assert_eq!(route_chip("sgp", &Monitor::default()).value, "No log");
+        assert_eq!(route_chip("sgp", &running(None)).value, "No data");
+    }
+
+    fn hold(
+        pick: &str,
+        pending: Option<&str>,
+        view: GameView,
+        monitor: &Monitor,
+    ) -> Option<String> {
+        hold_chip(pick, pending, view, monitor).map(|chip| chip.value)
+    }
+
+    #[test]
+    fn hold_chips_say_what_is_left_to_do() {
+        let game = Monitor {
+            game: true,
+            game_log: GameLog::Writing,
+            ..running(None)
+        };
+        let closed = running(None);
+        let value = |pending, view, monitor: &Monitor| hold("hkg", pending, view, monitor);
         assert_eq!(
-            route_label("sgp", &Monitor::default()),
-            "Game: turn on logging to see this, press F1"
+            value(Some("tyo"), GameView::Stale, &game).unwrap(),
+            "tyo after match"
         );
+        assert_eq!(value(None, GameView::Stale, &game).unwrap(), "Restart game");
         assert_eq!(
-            route_label(
-                "sgp",
-                &Monitor {
-                    exitlag: true,
-                    ..Monitor::default()
+            value(None, GameView::Stale, &closed).unwrap(),
+            "Next launch"
+        );
+        let ready = hold_chip("hkg", None, GameView::Ready { ms: 152 }, &game).unwrap();
+        assert_eq!((ready.value.as_str(), ready.tone), ("Ready", Tone::Good));
+        assert!(ready.tip.contains("measured hkg at 152 ms"));
+        assert_eq!(value(None, GameView::Unknown, &game).unwrap(), "Measuring");
+        assert_eq!(value(None, GameView::Unknown, &closed), None);
+        assert_eq!(hold("", None, GameView::Stale, &game), None);
+        assert_eq!(
+            hold_chip("hkg", None, GameView::Stale, &game).unwrap().name,
+            "Connection Hold"
+        );
+        for view in [
+            GameView::Unknown,
+            GameView::Stale,
+            GameView::Ready { ms: 1 },
+        ] {
+            for monitor in [&game, &closed] {
+                if let Some(chip) = hold_chip("hkg", None, view, monitor) {
+                    assert!(chip.line().is_ascii(), "{}", chip.line());
                 }
-            ),
-            "ExitLag route: turn on logging to see this, press F1"
+            }
+        }
+    }
+
+    #[test]
+    fn a_match_shows_on_the_hold_chip_whatever_the_pick() {
+        let playing = Monitor {
+            game: true,
+            game_log: GameLog::Writing,
+            ..running(Some(route(RouteState::InMatch, "sgp")))
+        };
+        for pick in ["sgp", "hkg", ""] {
+            let chip = hold_chip(pick, None, GameView::Ready { ms: 1 }, &playing).unwrap();
+            assert_eq!(chip.value, "In match", "{pick}");
+            assert!(chip.tip.contains("closes sgp waits"));
+        }
+        let after = Monitor {
+            game: false,
+            game_log: GameLog::NoGame,
+            ..playing.clone()
+        };
+        assert_eq!(
+            hold("sgp", None, GameView::Ready { ms: 1 }, &after).unwrap(),
+            "Ready",
+            "a closed game has no match to protect"
         );
         assert_eq!(
-            route_label("sgp", &running(None)),
-            "ExitLag route: no game data yet, press F1"
+            hold("sgp", Some("tyo"), GameView::Ready { ms: 1 }, &playing).unwrap(),
+            "tyo after match",
+            "a waiting pick says so first"
         );
+    }
+
+    #[test]
+    fn a_game_that_isnt_logging_turns_the_hold_off() {
+        let silent = Monitor {
+            game: true,
+            game_log: GameLog::Silent,
+            ..running(Some(route(RouteState::InMatch, "sgp")))
+        };
+        assert_eq!(
+            match_site(&silent),
+            None,
+            "an old launch's match doesn't count"
+        );
+        let chip = hold_chip("sgp", None, GameView::Ready { ms: 1 }, &silent).unwrap();
+        assert_eq!((chip.value.as_str(), chip.tone), ("No log", Tone::Warn));
+        assert!(chip.tip.contains("-condebug"));
+        let missing = Monitor {
+            game: true,
+            ..Monitor::default()
+        };
+        assert_eq!(
+            hold("sgp", None, GameView::Unknown, &missing).unwrap(),
+            "No log"
+        );
+        let checking = Monitor {
+            game_log: GameLog::Checking,
+            ..silent.clone()
+        };
+        assert_eq!(
+            match_site(&checking),
+            Some("sgp"),
+            "a match is protected while the log is still being checked"
+        );
+        let idle = Monitor {
+            route: None,
+            ..checking
+        };
+        assert_eq!(
+            hold("sgp", None, GameView::Ready { ms: 1 }, &idle).unwrap(),
+            "Checking"
+        );
+        assert_eq!(
+            hold("sgp", None, GameView::Unknown, &Monitor::default()).unwrap(),
+            "No log",
+            "with the game closed, it still says logging is off"
+        );
+    }
+
+    #[test]
+    fn the_log_counts_as_written_once_it_changes() {
+        let minute = Duration::from_secs(60);
+        let start = GameLog::NoGame;
+        assert_eq!(start.next(false, true, minute), GameLog::NoGame);
+        assert_eq!(start.next(true, false, Duration::ZERO), GameLog::Checking);
+        assert_eq!(
+            GameLog::Checking.next(true, false, SILENT_AFTER),
+            GameLog::Silent
+        );
+        assert_eq!(GameLog::Silent.next(true, true, minute), GameLog::Writing);
+        assert_eq!(
+            GameLog::Writing.next(true, false, SILENT_AFTER * 10),
+            GameLog::Writing,
+            "a logging game can go quiet for a long time"
+        );
+        assert_eq!(GameLog::Writing.next(false, false, minute), GameLog::NoGame);
+    }
+
+    #[test]
+    fn a_first_read_isnt_a_write() {
+        let mut tail = LogTail::default();
+        let dir = std::env::temp_dir().join(format!("dl-conn-rs-tail-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("console.log");
+        fs::write(&path, LOCATION).unwrap();
+        tail.read_new(&path).unwrap();
+        assert!(!tail.take_wrote());
+        let mut more = LOCATION.to_vec();
+        more.extend_from_slice(LOCATION);
+        fs::write(&path, &more).unwrap();
+        tail.read_new(&path).unwrap();
+        assert!(tail.take_wrote());
+        assert!(!tail.take_wrote(), "taking it clears it");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     const LOCATION: &[u8] = b"11/05 18:46:31 [SteamNetSockets] Ping location: sgp=120+12/121+12\n";

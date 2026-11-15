@@ -168,8 +168,19 @@ pub fn processes() -> String {
     found.join("  ")
 }
 
-pub fn exitlag_running() -> bool {
-    any_running(&["exitlag.exe"])
+/// Whether ExitLag and a game are running, from one look at the process list.
+pub fn exitlag_and_game_running() -> (bool, bool) {
+    let Some(running) = running() else {
+        return (false, false);
+    };
+    let names: Vec<String> = running
+        .into_iter()
+        .map(|(name, _)| name.to_lowercase())
+        .collect();
+    (
+        names.iter().any(|name| name == "exitlag.exe"),
+        names.iter().any(|name| GAMES.contains(&name.as_str())),
+    )
 }
 
 pub fn game_running() -> bool {

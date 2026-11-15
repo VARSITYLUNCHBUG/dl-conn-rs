@@ -23,8 +23,11 @@ pub enum Command {
     SetPick {
         server: String,
         backup: Option<String>,
+        /// Switch even if that would cut the match being played.
+        now: bool,
     },
     ClearPick,
+    ClearPending,
     RefreshRelays,
     ShowRoutes {
         server: Option<String>,
@@ -69,6 +72,11 @@ enum Param {
         value: &'static str,
         about: &'static str,
     },
+    /// An option that takes no value.
+    Flag {
+        name: &'static str,
+        about: &'static str,
+    },
 }
 
 #[derive(Default)]
@@ -78,9 +86,14 @@ struct Args {
     key: Option<String>,
     value: Option<String>,
     options: Vec<(&'static str, String)>,
+    flags: Vec<&'static str>,
 }
 
 impl Args {
+    fn flag(&self, name: &str) -> bool {
+        self.flags.contains(&name)
+    }
+
     fn option(&self, name: &str) -> Option<String> {
         self.options
             .iter()
@@ -153,15 +166,24 @@ static COMMANDS: &[Spec] = &[
                 value: SERVER_VALUE,
                 about: "Also keep this server open for failover. none skips the default backup",
             },
+            Param::Flag {
+                name: "--now",
+                about: "Switch now even if it cuts the match you're in",
+            },
         ],
-        summary: "Block every relay except this server's",
+        summary: "Block every relay except this server's. Mid-match, waits for the match to end",
         build: |args| {
             let backup = args.option("--backup");
+            let now = args.flag("--now");
             let server = args.server.unwrap_or_default();
             if backup.as_ref() == Some(&server) {
                 return Err("--backup must be a different server from the pick".to_string());
             }
-            Ok(Command::SetPick { server, backup })
+            Ok(Command::SetPick {
+                server,
+                backup,
+                now,
+            })
         },
     },
     Spec {
@@ -170,6 +192,13 @@ static COMMANDS: &[Spec] = &[
         params: &[],
         summary: "Remove the block so all servers are open",
         build: |_| Ok(Command::ClearPick),
+    },
+    Spec {
+        verb: "clear",
+        noun: "pending",
+        params: &[],
+        summary: "Drop a pick that's waiting for the match to end",
+        build: |_| Ok(Command::ClearPending),
     },
     Spec {
         verb: "clear",
@@ -325,6 +354,7 @@ impl Spec {
                 Param::Key { required: false } => "[<key>]".to_string(),
                 Param::Value => "<value>".to_string(),
                 Param::Option { name, value, .. } => format!("[{name} {value}]"),
+                Param::Flag { name, .. } => format!("[{name}]"),
             });
         }
         usage
@@ -351,6 +381,9 @@ impl Spec {
                 }
                 Param::Option { name, value, about } => {
                     lines.push(format!("  {name} {value}  {about}"));
+                }
+                Param::Flag { name, about } => {
+                    lines.push(format!("  {name}  {about}"));
                 }
             }
         }
@@ -418,11 +451,17 @@ pub fn parse(line: &str) -> Result<Command, String> {
             .params
             .iter()
             .any(|param| matches!(param, Param::Server { .. }));
+        let flag = spec.params.iter().find_map(|param| match param {
+            Param::Flag { name, .. } if name == word => Some(*name),
+            _ => None,
+        });
         if let Some((name, value)) = option {
             let Some(given) = rest.next() else {
                 return Err(format!("{name} needs {value}. Usage: {}", spec.usage()));
             };
             args.options.push((name, given.clone()));
+        } else if let Some(name) = flag {
+            args.flags.push(name);
         } else if takes_key && args.key.is_none() {
             if !settings::is_key(word) {
                 return Err(format!("unknown setting '{word}'. Try 'show config'"));
@@ -661,6 +700,14 @@ fn arguments(previous: &[String], word: &str, servers: &[ServerName]) -> Vec<Can
                     note: format!("{value}  {about}"),
                 });
             }
+            Param::Flag { name, about }
+                if name.starts_with(word) && !given.iter().any(|arg| arg == name) =>
+            {
+                candidates.push(Candidate {
+                    text: (*name).to_string(),
+                    note: (*about).to_string(),
+                });
+            }
             Param::Server { .. } if !word.starts_with('-') && !has_server(spec, given) => {
                 candidates.extend(matching_servers(word, servers));
             }
@@ -809,7 +856,8 @@ mod tests {
             parse("set pick FRA"),
             Ok(Command::SetPick {
                 server: "fra".to_string(),
-                backup: None
+                backup: None,
+                now: false,
             })
         );
         assert_eq!(parse("  clear   pick "), Ok(Command::ClearPick));
@@ -851,6 +899,7 @@ mod tests {
         let expected = Ok(Command::SetPick {
             server: "sgp".to_string(),
             backup: Some("maa2".to_string()),
+            now: false,
         });
         assert_eq!(parse("set pick sgp --backup maa2"), expected);
         assert_eq!(parse("set pick --backup maa2 sgp"), expected);
@@ -869,6 +918,25 @@ mod tests {
                 .unwrap_err()
                 .contains("different server")
         );
+    }
+
+    #[test]
+    fn now_is_a_flag_in_any_position() {
+        let expected = Ok(Command::SetPick {
+            server: "sgp".to_string(),
+            backup: Some("maa2".to_string()),
+            now: true,
+        });
+        assert_eq!(parse("set pick sgp --now --backup maa2"), expected);
+        assert_eq!(parse("set pick --now sgp --backup maa2"), expected);
+        assert_eq!(parse("set pick sgp --backup maa2 --now"), expected);
+        assert_eq!(parse("clear pending"), Ok(Command::ClearPending));
+        assert!(
+            parse("clear pick --now")
+                .unwrap_err()
+                .contains("unexpected '--now'")
+        );
+        assert!(help(Some("set pick")).unwrap().join("\n").contains("--now"));
     }
 
     #[test]
@@ -954,8 +1022,10 @@ mod tests {
         assert_eq!(texts("set pick fra --backup j"), ["jnb"]);
         assert_eq!(texts("set pick fra --backup south"), ["jnb"]);
         assert_eq!(texts("set pick fra --b"), ["--backup"]);
-        assert_eq!(texts("set pick fra "), ["--backup"]);
-        assert!(texts("set pick fra --backup jnb ").is_empty());
+        assert_eq!(texts("set pick fra "), ["--backup", "--now"]);
+        assert_eq!(texts("set pick fra --now "), ["--backup"]);
+        assert_eq!(texts("set pick fra --backup jnb "), ["--now"]);
+        assert_eq!(texts("set pick fra --n"), ["--now"]);
         assert_eq!(texts("set pick --backup jnb f"), ["fra"]);
     }
 

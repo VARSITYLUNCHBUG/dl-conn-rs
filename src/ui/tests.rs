@@ -509,8 +509,13 @@ fn the_theme_setting_changes_the_window() {
 #[test]
 fn it_works_with_no_exitlag_no_steam_and_no_log() {
     let mut harness = harness(FakeFirewall::default());
-    harness.get_by_label("Direct: pick a server");
-    harness.get_by_label("Game: turn on logging to see this, press F1");
+    assert!(
+        harness.query_by_label("Direct").is_none(),
+        "nothing to ping"
+    );
+    harness.get_by_label("Game");
+    harness.get_by_label("Connection Hold");
+    assert_eq!(harness.query_all_by_label("No log").count(), 2);
     assert!(harness.query_by_label_contains("ExitLag").is_none());
     search(&mut harness, "sgp");
     press(&mut harness, Key::Enter);
@@ -577,6 +582,22 @@ fn screenshots() {
         press(&mut harness, Key::Enter);
         wait(&mut harness, |app| !pick(app).is_empty());
         shot(&mut harness, "picked");
+        let site = pick(harness.state());
+        let mut state = game_state(
+            Some((crate::analysis::RouteState::Measured, &site)),
+            &format!("{site}=121"),
+        );
+        state.exitlag = true;
+        state.direct = crate::monitor::Direct::Ms(351);
+        harness.state().session().inject_monitor(state);
+        wait(&mut harness, |app| hold(app).as_deref() == Some("Ready"));
+        shot(&mut harness, "chips");
+        harness.get_by_label("Ready").hover();
+        for _ in 0..10 {
+            harness.step();
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        shot(&mut harness, "tooltip");
         press(&mut harness, Key::F1);
         std::thread::sleep(Duration::from_millis(100));
         shot(&mut harness, "help");
@@ -594,4 +615,108 @@ fn screenshots() {
         std::thread::sleep(Duration::from_millis(200));
         shot(&mut harness, "console");
     }
+}
+
+/// What the monitor reports while the game runs, with its log showing `route` and `table`.
+fn game_state(
+    route: Option<(crate::analysis::RouteState, &str)>,
+    table: &str,
+) -> crate::monitor::Monitor {
+    let table = table
+        .split(',')
+        .filter_map(|entry| {
+            let (site, ms) = entry.split_once('=')?;
+            Some(crate::analysis::PingEntry {
+                site: site.to_string(),
+                direct: ms.parse().ok(),
+                via: None,
+                penalty: 0,
+            })
+        })
+        .collect();
+    crate::monitor::Monitor {
+        game: true,
+        game_log: crate::monitor::GameLog::Writing,
+        log_found: true,
+        route: route.map(|(state, site)| crate::analysis::Route {
+            site: site.to_string(),
+            ms: 120,
+            at: "18:46".to_string(),
+            state,
+        }),
+        table,
+        ..crate::monitor::Monitor::default()
+    }
+}
+
+/// The Connection Hold chip's value.
+fn hold(app: &App) -> Option<String> {
+    let data = app.data()?;
+    let chip = data
+        .view
+        .chips
+        .iter()
+        .find(|chip| chip.name == crate::monitor::HOLD)?;
+    Some(chip.value.clone())
+}
+
+#[test]
+fn the_header_says_when_the_game_measured_before_the_pick() {
+    let mut harness = harness(FakeFirewall::default());
+    search(&mut harness, "jnb");
+    press(&mut harness, Key::Enter);
+    wait(&mut harness, |app| pick(app) == "jnb");
+    harness
+        .state()
+        .session()
+        .inject_monitor(game_state(None, "sgp=119,jnb="));
+    wait(&mut harness, |app| {
+        hold(app).as_deref() == Some("Restart game")
+    });
+    harness.get_by_label("Restart game").hover();
+    for _ in 0..20 {
+        harness.step();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        harness
+            .query_by_label_contains("only measures when it starts")
+            .is_some(),
+        "the chip explains itself on hover"
+    );
+
+    harness
+        .state()
+        .session()
+        .inject_monitor(game_state(None, "jnb=4,sgp="));
+    wait(&mut harness, |app| hold(app).as_deref() == Some("Ready"));
+}
+
+#[test]
+fn a_pick_mid_match_waits_and_the_header_says_so() {
+    let firewall = FakeFirewall::default();
+    let mut harness = harness(firewall.clone());
+    search(&mut harness, "sgp");
+    press(&mut harness, Key::Enter);
+    wait(&mut harness, |app| pick(app) == "sgp");
+    let session = harness.state().session().clone();
+    session.inject_monitor(game_state(
+        Some((crate::analysis::RouteState::InMatch, "sgp")),
+        "sgp=119",
+    ));
+    wait(&mut harness, |app| hold(app).as_deref() == Some("In match"));
+    search(&mut harness, "jnb");
+    press(&mut harness, Key::Enter);
+    wait(&mut harness, |app| {
+        hold(app).as_deref() == Some("jnb after match")
+    });
+    assert_eq!(pick(harness.state()), "sgp", "the match isn't cut");
+    assert!(firewall.stamp().unwrap().starts_with("sgp "));
+
+    session.inject_monitor(game_state(
+        Some((crate::analysis::RouteState::LastMatch, "sgp")),
+        "sgp=119",
+    ));
+    wait(&mut harness, |app| pick(app) == "jnb");
+    assert!(firewall.stamp().unwrap().starts_with("jnb "));
 }

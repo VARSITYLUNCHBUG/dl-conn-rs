@@ -8,7 +8,7 @@ use super::theme;
 use crate::log;
 use crate::session::{Handle, Host, Output, Reply, Server, Status};
 use crate::settings::Row;
-use eframe::egui::{self, Context, Key, Modifiers, RichText, Ui, ViewportCommand};
+use eframe::egui::{self, Context, Key, Modifiers, Ui, ViewportCommand};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -329,8 +329,7 @@ impl App {
         }
         ui.add_space(4.0);
         if let Some(data) = &self.data {
-            ui.label(RichText::new(&data.view.direct));
-            ui.label(RichText::new(&data.view.route));
+            pages::chips(ui, &data.view.chips);
         }
         ui.add_space(4.0);
         self.tabs(ui);
@@ -455,7 +454,7 @@ fn view_loop(session: &Handle, changes: &Receiver<()>, updates: &Sender<Update>,
             let view = rows::build_view(&servers, &status);
             let data = ViewData {
                 servers,
-                status,
+                status: *status,
                 config,
                 view,
             };

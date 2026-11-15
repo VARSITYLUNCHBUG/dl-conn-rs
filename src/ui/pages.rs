@@ -5,11 +5,13 @@ use super::theme::{self, Palette};
 use crate::command;
 use crate::editor::{Action, Editor, Key as EditorKey};
 use crate::log;
+use crate::monitor::{Chip, Tone};
 use crate::session::{Handle, Server, Status};
 use crate::settings::{Kind, Row};
 use eframe::egui::{
-    self, Color32, Event, EventFilter, FontFamily, FontId, Id, Key, Label, Modifiers, RichText,
-    ScrollArea, TextEdit, TextFormat, TextStyle, TextWrapMode, Ui, Vec2,
+    self, Color32, CornerRadius, Event, EventFilter, FontFamily, FontId, Id, Key, Label, Margin,
+    Modifiers, RichText, ScrollArea, Stroke, TextEdit, TextFormat, TextStyle, TextWrapMode, Ui,
+    Vec2,
     text::{CCursor, CCursorRange, LayoutJob},
 };
 use std::collections::{HashMap, VecDeque};
@@ -101,44 +103,67 @@ pub fn text_page(ui: &mut Ui, lines: &[String]) {
     });
 }
 
-/// The status page's rows, as label and value.
-pub fn status_rows(status: &Status) -> Vec<(&'static str, String)> {
-    let mut rows = vec![(
-        "Server",
-        match (status.pick.as_str(), &status.pick_desc) {
-            ("", _) => "None, all servers are open".to_string(),
-            (code, Some(desc)) => format!("{desc} ({code})"),
-            (code, None) => format!("{code}, not in the current relay list"),
-        },
-    )];
+/// One row of the status page: a label, a short value, and an explanation shown on hover.
+#[derive(Debug, PartialEq)]
+pub struct StatusRow {
+    pub label: &'static str,
+    pub value: String,
+    pub tip: Option<&'static str>,
+}
+
+fn row(label: &'static str, value: String, tip: Option<&'static str>) -> StatusRow {
+    StatusRow { label, value, tip }
+}
+
+/// The status page's rows.
+pub fn status_rows(status: &Status) -> Vec<StatusRow> {
+    // The dropdown already names the pick, so only say what it can't.
+    let mut rows = Vec::new();
+    match (status.pick.as_str(), &status.pick_desc) {
+        ("", _) => rows.push(row(
+            "Block",
+            "Off".to_string(),
+            Some("Every server is open. Pick one in the dropdown to block the rest."),
+        )),
+        (_, None) => rows.push(row(
+            "Server",
+            "Not in relay list".to_string(),
+            Some("Steam's current relay list doesn't have this server. Its block stays on."),
+        )),
+        (_, Some(_)) => {}
+    }
     if !status.pick.is_empty() {
-        rows.push((
-            "Backup",
-            status
-                .backup
-                .clone()
-                .unwrap_or_else(|| "None, one relay with no failover".to_string()),
-        ));
-        rows.push((
-            "Blocked",
-            format!(
-                "{} relays across {} sites",
-                status.blocked, status.sites_blocked
+        rows.push(match &status.backup {
+            Some(backup) => row(
+                "Backup",
+                backup.clone(),
+                Some("Also open, so the game has a relay to fail over to."),
             ),
+            None => row(
+                "Backup",
+                "None".to_string(),
+                Some("The game has one relay and no failover. Set a default backup in F2."),
+            ),
+        });
+        rows.push(row(
+            "Blocked",
+            format!("{} relays, {} sites", status.blocked, status.sites_blocked),
+            Some("Every relay outside your pick and backup."),
         ));
     }
-    rows.push((
-        "Relay list",
-        if status.offline {
-            "Offline, retrying".to_string()
-        } else if status.loaded {
-            "Up to date".to_string()
-        } else {
-            "Loading".to_string()
-        },
-    ));
+    rows.push(if status.offline {
+        row(
+            "Relay list",
+            "Offline".to_string(),
+            Some("Steam couldn't be reached. Retrying. The block stays as it is."),
+        )
+    } else if status.loaded {
+        row("Relay list", "Up to date".to_string(), None)
+    } else {
+        row("Relay list", "Loading".to_string(), None)
+    });
     if let Some(error) = &status.error {
-        rows.push(("Error", error.clone()));
+        rows.push(row("Error", error.clone(), None));
     }
     rows
 }
@@ -148,28 +173,55 @@ pub fn status_page(ui: &mut Ui, status: Option<&Status>) {
         ui.label("Loading...");
         return;
     };
+    let palette = colours(ui);
     ui.add_space(4.0);
     egui::Grid::new("status")
         .num_columns(2)
         .spacing([18.0, 8.0])
         .show(ui, |ui| {
-            for (label, value) in status_rows(status) {
-                ui.colored_label(colours(ui).muted, label);
-                ui.add(Label::new(value).selectable(true));
+            for row in status_rows(status) {
+                ui.colored_label(palette.muted, row.label);
+                let value = ui.add(Label::new(row.value).selectable(true));
+                if let Some(tip) = row.tip {
+                    value.on_hover_text(tip);
+                }
                 ui.end_row();
             }
         });
     ui.add_space(14.0);
     ui.colored_label(
-        colours(ui).muted,
-        "A block lasts until you pick again or restart the PC, even after dl-conn-rs closes.",
+        palette.muted,
+        "Blocks stay on until you pick again or restart the PC.",
     );
-    ui.colored_label(
-        colours(ui).muted,
-        "New here? Press F1 for how to test your connection.",
-    );
+    ui.colored_label(palette.muted, "Press F1 to test your connection.");
 }
 
+/// The counters as chips: a name and a short value, with the explanation on hover.
+pub fn chips(ui: &mut Ui, chips: &[Chip]) {
+    let palette = colours(ui);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+        for chip in chips {
+            let tone = match chip.tone {
+                Tone::Plain => palette.text,
+                Tone::Good => palette.ok,
+                Tone::Warn => palette.check,
+            };
+            let response = egui::Frame::new()
+                .fill(palette.raised)
+                .stroke(Stroke::new(1.0, palette.border))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::symmetric(9, 3))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    ui.label(RichText::new(chip.name).color(palette.muted));
+                    ui.label(RichText::new(&chip.value).color(tone).strong());
+                })
+                .response;
+            response.on_hover_text(&chip.tip);
+        }
+    });
+}
 /// Whatever the settings page has been asked to do.
 #[derive(Default)]
 pub struct SettingsPage {
@@ -461,6 +513,7 @@ fn perform(action: Action, session: &Handle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::GameView;
     use crate::monitor::Monitor;
 
     fn status() -> Status {
@@ -474,6 +527,8 @@ mod tests {
             offline: false,
             error: None,
             monitor: Monitor::default(),
+            pending: None,
+            view: GameView::Unknown,
         }
     }
 
@@ -511,9 +566,14 @@ mod tests {
 
     #[test]
     fn status_rows_say_what_is_on() {
+        let value = |rows: &[StatusRow], label: &str| {
+            rows.iter()
+                .find(|row| row.label == label)
+                .map(|row| row.value.clone())
+        };
         let rows = status_rows(&status());
-        assert!(rows[0].1.contains("all servers are open"));
-        assert!(!rows.iter().any(|(label, _)| *label == "Blocked"));
+        assert_eq!(value(&rows, "Block").unwrap(), "Off");
+        assert_eq!(value(&rows, "Blocked"), None);
         let picked = Status {
             pick: "jnb".to_string(),
             pick_desc: Some("Johannesburg (South Africa)".to_string()),
@@ -522,12 +582,15 @@ mod tests {
             ..status()
         };
         let rows = status_rows(&picked);
-        assert_eq!(rows[0].1, "Johannesburg (South Africa) (jnb)");
-        assert!(
-            rows.iter()
-                .any(|(_, value)| value == "216 relays across 44 sites")
-        );
-        assert!(rows.iter().any(|(_, value)| value.contains("no failover")));
+        assert_eq!(value(&rows, "Server"), None, "the dropdown names it");
+        assert_eq!(value(&rows, "Block"), None);
+        assert_eq!(value(&rows, "Blocked").unwrap(), "216 relays, 44 sites");
+        assert_eq!(value(&rows, "Backup").unwrap(), "None");
+        let backup = rows.iter().find(|row| row.label == "Backup").unwrap();
+        assert!(backup.tip.unwrap().contains("no failover"));
+        for row in &rows {
+            assert!(row.value.is_ascii() && row.tip.unwrap_or("").is_ascii());
+        }
     }
 
     #[test]
@@ -537,13 +600,12 @@ mod tests {
             error: Some("denied".to_string()),
             ..status()
         });
-        assert!(rows.iter().any(|(_, value)| value.contains("Offline")));
+        assert!(rows.iter().any(|row| row.value == "Offline"));
         assert!(
             rows.iter()
-                .any(|(label, value)| *label == "Error" && value == "denied")
+                .any(|row| row.label == "Error" && row.value == "denied")
         );
     }
-
     #[test]
     fn a_backup_list_keeps_a_saved_server_visible() {
         let servers = vec![Server {
